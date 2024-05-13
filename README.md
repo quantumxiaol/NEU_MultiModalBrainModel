@@ -9,16 +9,16 @@
 
 我实验了3个编码器，分别是基于边卷积的E2EModel，一个我自己的从超图理论获得灵感的SimpleTransformerModel，以及一个融合了图神经网络(GNN)和Transformer的SGFormer。在ABIDE(Autism Brain Imaging Data Exchange)数据集上进行了实验，该数据集包含了丰富的自闭症谱系障碍(ASD)患者与健康对照组的脑成像数据，经过处理后得到了脑区之间的连通性数据。
 
-编码器	ACC	Time
-E2EModel	0.642881 	71.13 
-SimpleTransformer	0.677273	3.49 
-SGFormer	0.536181 	89.25 
+| 编码器	|ACC	|Time|
+| :---: | :---: | :---: |
+| E2EModel |	0.642881 | 	71.13 |
+| SimpleTransformer |	0.677273 |	3.49 |
+| SGFormer |	0.536181 | 	89.25 |
 
 如上表所示，SimplerTransformer的时间短、效果好，因此后面的多模板模型将基于SimpleTransformer。这个模型能够捕获输入数据的长距离依赖关系，适合于处理超节点间的复杂关系。
 
 之后在不同的脑图谱上进行了独立的训练和十折交叉验证，寻找信息容量较大的视图，据此选定了相对重要的视图(aal, cc400, ez)。
 
-https://github.com/quantumxiaol/NEU_MultiModalBrainModel/blob/main/png/simpleTransormer.png
 
 ![SimpleTransormer](https://github.com/quantumxiaol/NEU_MultiModalBrainModel/blob/main/png/simpleTransormer.png "SimpleTransormer")
 
@@ -26,9 +26,10 @@ https://github.com/quantumxiaol/NEU_MultiModalBrainModel/blob/main/png/simpleTra
 
 开发MultiModalBrainModel是为了试图利用不同粒度下的脑区划分带来的多视角信息。这个模型利用了多个子模型来从原始脑区连通度捕获特征，Transformer Encoder来提取和融合特征，最终用于分类任务。模型的结构设计用于捕捉不同模态间的相似性和差异性，有助于处理结构性和功能性脑成像数据。该模型包含了两个编码器，分别从相似性和差异性的角度学习不同视图间的特征，通过分类损失和相似性损失的结合来更新编码器。使用CosineSimilarity作为相似性损失函数，探索不同视图中的共同疾病相关特征。采用InfoNCE作为差异性损失函数，寻找不同视图的差异。
 
-模型	ACC	Recall	F1score	AUC
-MultiModalBrainModel	0.692385	0.680739	0.671735	0.729583
-SimplerTransformer(cc400)	0.686507	0.686950	0.681376	0.756921
-SimplerTransformer(aal)	0.622309	0.635767	0.626127	0.688950
+| 模型 |	ACC |	Recall |	F1score |	AUC |
+| :---: | :---: | :---: | :---: |
+| MultiModalBrainModel |	0.692385 |	0.680739 |	0.671735 |	0.729583 |
+| SimplerTransformer(cc400) |	0.686507 |	0.686950 |	0.681376 |	0.756921 |
+| SimplerTransformer(aal) |	0.622309 |	0.635767 |	0.626127 |	0.688950 |
 
 目前在独立的训练和十折交叉验证中平均准确率(ACC)为0.692385，平均召回率(Recall)为0.680739，平均F1score为0.671735，平均ROC曲线下与坐标轴围成的面积(AUC)为0.729583，这比单一的cc400和aal表现好，表明模型能够利用多视图的信息，同时具有更好的鲁棒性和泛化能力。
