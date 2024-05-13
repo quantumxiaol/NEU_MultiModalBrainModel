@@ -18,6 +18,12 @@ SGFormer	0.536181 	89.25
 
 之后在不同的脑图谱上进行了独立的训练和十折交叉验证，寻找信息容量较大的视图，据此选定了相对重要的视图(aal, cc400, ez)。
 
+https://github.com/quantumxiaol/NEU_MultiModalBrainModel/blob/main/png/simpleTransormer.png
+
+![SimpleTransormer](https://github.com/quantumxiaol/NEU_MultiModalBrainModel/blob/main/png/simpleTransormer.png "SimpleTransormer")
+
+![MultiModalBrain](https://github.com/quantumxiaol/NEU_MultiModalBrainModel/blob/main/png/MultiModalBrain.png "MultiModalBrain")
+
 开发MultiModalBrainModel是为了试图利用不同粒度下的脑区划分带来的多视角信息。这个模型利用了多个子模型来从原始脑区连通度捕获特征，Transformer Encoder来提取和融合特征，最终用于分类任务。模型的结构设计用于捕捉不同模态间的相似性和差异性，有助于处理结构性和功能性脑成像数据。该模型包含了两个编码器，分别从相似性和差异性的角度学习不同视图间的特征，通过分类损失和相似性损失的结合来更新编码器。使用CosineSimilarity作为相似性损失函数，探索不同视图中的共同疾病相关特征。采用InfoNCE作为差异性损失函数，寻找不同视图的差异。
 
 模型	ACC	Recall	F1score	AUC
