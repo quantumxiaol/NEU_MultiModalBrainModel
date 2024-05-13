@@ -1,6 +1,6 @@
 包含7个脑图谱，可从
 
-百度网盘 
+百度网盘 链接：https://pan.baidu.com/s/13mjED3PkfqtHWxxywpIGeA?pwd=unix 提取码：unix
 
 或 夸克网盘 我用夸克网盘分享了「ABIDE-871」，链接：https://pan.quark.cn/s/d0935ee9cc31
 
