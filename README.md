@@ -9,7 +9,11 @@
 
 我实验了3个编码器，分别是基于边卷积的E2EModel，一个我自己的从超图理论获得灵感的SimpleTransformerModel，以及一个融合了图神经网络(GNN)和Transformer的SGFormer。在ABIDE(Autism Brain Imaging Data Exchange)数据集上进行了实验，该数据集包含了丰富的自闭症谱系障碍(ASD)患者与健康对照组的脑成像数据，经过处理后得到了脑区之间的连通性数据。
 
-| 编码器	|ACC	|Time|
+编码器的实验[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1itucZ6gqmhtzutG-fLSuotDHyweQstYc#scrollTo=TH2QjtkHZwHK)
+
+我自己的是RTX4080LaptopGPU（12GB）,下面的时间是在此设备上的计算时间。
+
+| 编码器	|ACC	|Time(s)|
 | :---: | :---: | :---: |
 | E2EModel |	0.642881 | 	71.13 |
 | SimpleTransformer |	0.677273 |	3.49 |
