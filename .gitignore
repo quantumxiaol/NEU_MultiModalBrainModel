@@ -1,0 +1,12 @@
+# 数据集
+
+ABIDEdata/*.txt
+ABIDEdata/*.mat
+ABIDE.ipynb
+
+# 模型参数
+
+model*/
+
+.venv/
+venv/

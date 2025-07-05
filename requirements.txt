@@ -1,7 +1,14 @@
-torch==1.12.1+cu113
+# torch==1.12.1+cu113
+# uv
+# uv pip install torch
+# conda 
+# pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu113
+
 numpy==1.23.5
 scikit-learn==1.1.3
 scipy==1.10.1
 pandas==1.5.1
 matplotlib==3.6.2
-python_version == "3.8.14"
+
+# To Run ABIDE.ipynb in uv
+# uv pip install ipykernel pip
