@@ -1,3 +1,10 @@
+"""
+https://github.com/qitianwu/SGFormer
+
+uv pip install torch_sparse==0.6.10 --no-build-isolation
+uv pip install torch_geometric==1.7.2 --no-build-isolation
+"""
+
 import math
 import os
 import torch

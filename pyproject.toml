@@ -12,4 +12,5 @@ dependencies = [
 "matplotlib==3.6.2",
 "pip==25.0.1",
 "ipykernel==6.29.5",
+"setuptools==75.3.2",
 ]
