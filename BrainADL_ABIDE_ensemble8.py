@@ -9,6 +9,7 @@ import scipy.io as scio
 from torch.optim import lr_scheduler
 import time
 import pandas as pd
+import os
 from sklearn.metrics import accuracy_score, recall_score, f1_score,roc_auc_score
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -697,6 +698,7 @@ for ind in range(1):
                 recall_list.append(recall)
                 f1_list.append(f1)
 
+        os.makedirs('./modelstfensemble8', exist_ok=True)
 
         torch.save(multi_modal_model.state_dict(), './modelstfensemble8/' + str(kfold_index) + '.pt')
         result.append([kfold_index, acc])

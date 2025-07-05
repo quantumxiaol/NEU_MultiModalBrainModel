@@ -8,6 +8,7 @@ from sklearn import metrics
 import scipy.io as scio
 from torch.optim import lr_scheduler
 import time
+import os
 from sklearn.metrics import accuracy_score, recall_score, f1_score,roc_auc_score
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(device)
@@ -265,6 +266,7 @@ for ind in range(1):
                 print('Test acc', acc, 'Test recall', recall, 'Test f1', f1, 'Test auc', auc_score)
                 recall_list.append(recall)
                 f1_list.append(f1)
+        os.makedirs('./modelsBrainNetcc400', exist_ok=True)
 
         torch.save(model.state_dict(), './modelsBrainNetcc400/' + str(kfold_index) + '.pt')
         result.append([kfold_index, acc])

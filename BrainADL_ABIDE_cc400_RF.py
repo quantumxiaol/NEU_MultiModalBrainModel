@@ -9,6 +9,7 @@ from sklearn.ensemble import RandomForestClassifier
 import scipy.io as scio
 from torch.optim import lr_scheduler
 import time
+import os
 from sklearn.metrics import roc_auc_score, recall_score, f1_score
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(device)

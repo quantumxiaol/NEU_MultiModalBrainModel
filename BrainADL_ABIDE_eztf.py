@@ -7,7 +7,7 @@ import random
 from sklearn import metrics
 import scipy.io as scio
 from torch.optim import lr_scheduler
-
+import os
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(device)
 
@@ -210,6 +210,7 @@ for ind in range(1):
                 preds = indices.cpu()
                 acc = metrics.accuracy_score(preds, Y_test)
                 print('Test acc', acc)
+        os.makedirs('./modelstfez', exist_ok=True)
 
         torch.save(model.state_dict(), './modelstfez/' + str(kfold_index) + '.pt')
         result.append([kfold_index, acc])
