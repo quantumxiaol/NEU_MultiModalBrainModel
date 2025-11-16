@@ -10,3 +10,4 @@ model*/
 
 .venv/
 venv/
+.env

@@ -9,7 +9,10 @@ import scipy.io as scio
 from torch.optim import lr_scheduler
 import time
 import os
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+from dotenv import load_dotenv
+load_dotenv()
+# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device(os.getenv("DEVICE","cpu"))
 print(device)
 
 def setup_seed(seed):

@@ -12,7 +12,11 @@ from SGFormer import SGFormer
 from torch_geometric.data import Data
 from torch_geometric.data import DataLoader
 import time
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+import os
+from dotenv import load_dotenv
+load_dotenv()
+# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device(os.getenv("DEVICE","cpu"))
 print(device)
 
 def setup_seed(seed):
@@ -228,6 +232,8 @@ for ind in range(1):
                 acc = correct / len(test_loader.dataset)
                 print('Test acc', acc)
 
+        # Create directory if it doesn't exist
+        os.makedirs('./modelsnf', exist_ok=True)
         torch.save(model.state_dict(), './modelsnf/' + str(kfold_index) + '.pt')
         result.append([kfold_index, acc])
         acc_all += acc

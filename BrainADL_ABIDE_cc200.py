@@ -8,7 +8,10 @@ from sklearn import metrics
 import scipy.io as scio
 import time
 import os
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+from dotenv import load_dotenv
+load_dotenv()
+# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device(os.getenv("DEVICE","cpu"))
 print(device)
 
 def setup_seed(seed):

@@ -32,14 +32,23 @@ class GraphConvLayer(nn.Module):
 
     def forward(self, x, edge_index, x0):
         N = x.shape[0]
+        # Store original device
+        device = x.device
         row, col = edge_index
-        d = degree(col, N).float()
-        d_norm_in = (1. / d[col]).sqrt()
-        d_norm_out = (1. / d[row]).sqrt()
-        value = torch.ones_like(row) * d_norm_in * d_norm_out
+        # torch_sparse requires indices, values, and input matrix to be on CPU
+        row_cpu = row.cpu()
+        col_cpu = col.cpu()
+        x_cpu = x.cpu()
+        d = degree(col_cpu, N).float()
+        d_norm_in = (1. / d[col_cpu]).sqrt()
+        d_norm_out = (1. / d[row_cpu]).sqrt()
+        value = torch.ones_like(row_cpu) * d_norm_in * d_norm_out
         value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
-        adj = SparseTensor(row=col, col=row, value=value, sparse_sizes=(N, N))
-        x = matmul(adj, x)  # [N, D]
+        # Keep everything on CPU for torch_sparse operations
+        adj = SparseTensor(row=col_cpu, col=row_cpu, value=value, sparse_sizes=(N, N))
+        x = matmul(adj, x_cpu)  # [N, D]
+        # Move result back to original device
+        x = x.to(device)
 
         if self.use_init:
             x = torch.cat([x, x0], 1)
