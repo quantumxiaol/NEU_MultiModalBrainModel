@@ -8,7 +8,10 @@ from sklearn import metrics
 import scipy.io as scio
 from torch.optim import lr_scheduler
 import os
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+from dotenv import load_dotenv
+load_dotenv()
+# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device(os.getenv("DEVICE","cpu"))
 print(device)
 
 def setup_seed(seed):
@@ -210,7 +213,7 @@ for ind in range(1):
                 preds = indices.cpu()
                 acc = metrics.accuracy_score(preds, Y_test)
                 print('Test acc', acc)
-        os.makedirs('./modelstfensemble8', exist_ok=True)
+        os.makedirs('./modelstfdos160', exist_ok=True)
         torch.save(model.state_dict(), './modelstfdos160/' + str(kfold_index) + '.pt')
         result.append([kfold_index, acc])
         acc_all += acc

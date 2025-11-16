@@ -11,8 +11,10 @@ import time
 import pandas as pd
 import os
 from sklearn.metrics import accuracy_score, recall_score, f1_score,roc_auc_score
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+from dotenv import load_dotenv
+load_dotenv()
+# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device(os.getenv("DEVICE","cpu"))
 print(device)
 
 def setup_seed(seed):

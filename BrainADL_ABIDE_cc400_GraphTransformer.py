@@ -10,7 +10,10 @@ from torch.optim import lr_scheduler
 import time
 import os
 from sklearn.metrics import accuracy_score, recall_score, f1_score,roc_auc_score
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+from dotenv import load_dotenv
+load_dotenv()
+# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device(os.getenv("DEVICE","cpu"))
 print(device)
 
 # https://github.com/Wayfear/BrainNetworkTransformer/blob/main/source/models/transformer.py

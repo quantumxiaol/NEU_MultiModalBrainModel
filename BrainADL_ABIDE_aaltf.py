@@ -9,7 +9,11 @@ import scipy.io as scio
 from torch.optim import lr_scheduler
 import time
 from sklearn.metrics import roc_auc_score, recall_score, f1_score
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+import os
+from dotenv import load_dotenv
+load_dotenv()
+# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+device = torch.device(os.getenv("DEVICE","cpu"))
 print(device)
 
 def setup_seed(seed):
@@ -235,6 +239,7 @@ for ind in range(1):
                 recall_list.append(recall)
                 f1_list.append(f1)
 
+        os.makedirs('./modelstfaal', exist_ok=True)
         torch.save(model.state_dict(), './modelstfaal/' + str(kfold_index) + '.pt')
         result.append([kfold_index, acc])
         acc_all += acc
