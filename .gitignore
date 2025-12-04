@@ -11,3 +11,12 @@ model*/
 .venv/
 venv/
 .env
+
+# paper
+*.pdf
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+*.toc

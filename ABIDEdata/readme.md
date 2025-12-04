@@ -6,6 +6,8 @@
 
 或 [夸克网盘](https://pan.quark.cn/s/d0935ee9cc31)
 
+或 [Google Drive](https://drive.google.com/drive/folders/1FLlt7bdVw5B8ZS7TXUHOEAa3ckhQkHo5?usp=sharing)
+
 下载
 
 包含以下文件
