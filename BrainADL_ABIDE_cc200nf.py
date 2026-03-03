@@ -1,23 +1,26 @@
-import torch.nn as nn
-import torch.nn.functional as F
-import torch
-import torch.optim as optim
-import numpy as np
+import copy
+import os
 import random
-from sklearn import metrics
+import time
+
+import numpy as np
 import scipy.io as scio
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from dotenv import load_dotenv
+from sklearn import metrics
+from sklearn.model_selection import KFold, train_test_split
 from torch.optim import lr_scheduler
-from NodeFormer import NodeFormer
-from SGFormer import SGFormer
 from torch_geometric.data import Data
 from torch_geometric.data import DataLoader
-import time
-import os
-from dotenv import load_dotenv
+
+from SGFormer import SGFormer
+
 load_dotenv()
-# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-device = torch.device(os.getenv("DEVICE","cpu"))
+device = torch.device(os.getenv("DEVICE", "cpu"))
 print(device)
+
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -26,227 +29,237 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
+
+def matrix_to_graph(matrix, label, threshold=0.2):
+    num_nodes = matrix.shape[0]
+    row, col = np.where(np.abs(matrix) > threshold)
+    non_diag = row != col
+    row = row[non_diag]
+    col = col[non_diag]
+
+    if row.size == 0:
+        row = np.arange(num_nodes)
+        col = np.arange(num_nodes)
+        edge_weight = np.ones(num_nodes, dtype=np.float32)
+    else:
+        edge_weight = matrix[row, col].astype(np.float32)
+
+    edge_index = torch.tensor(np.stack([row, col], axis=0), dtype=torch.long)
+    edge_weight = torch.tensor(edge_weight, dtype=torch.float32)
+    x = torch.eye(num_nodes, dtype=torch.float32)
+    y = torch.tensor([int(label)], dtype=torch.long)
+    return Data(x=x, edge_index=edge_index, edge_attr=edge_weight, y=y)
+
+
+def build_graphs(matrices, labels, threshold=0.2):
+    return [matrix_to_graph(matrix, label, threshold=threshold) for matrix, label in zip(matrices, labels)]
+
+
+def evaluate(model, loader, loss_fn, device):
+    model.eval()
+    loss_sum = 0.0
+    sample_count = 0
+    all_preds = []
+    all_labels = []
+    with torch.no_grad():
+        for data in loader:
+            data = data.to(device)
+            outputs = model(data.x, data.edge_index, data.batch)
+            loss = loss_fn(outputs, data.y)
+            batch_graphs = data.num_graphs
+            loss_sum += loss.item() * batch_graphs
+            sample_count += batch_graphs
+            preds = torch.argmax(outputs, dim=1).cpu().numpy()
+            labels = data.y.cpu().numpy()
+            all_preds.extend(preds.tolist())
+            all_labels.extend(labels.tolist())
+
+    mean_loss = loss_sum / max(sample_count, 1)
+    acc = metrics.accuracy_score(all_labels, all_preds) if sample_count > 0 else 0.0
+    return mean_loss, acc
+
+
 setup_seed(123)
 
-N_subjects = 871
-
-
-'''
-    导入ABIDE数据
-'''
-
-print('loading ABIDE data...')
-Data_atlas1 = scio.loadmat('./ABIDEdata/pcc_correlation_871_cc200_.mat')
-X = Data_atlas1['connectivity']
-Y = np.loadtxt('./ABIDEdata/871_label_cc200.txt')
+print("loading ABIDE data...")
+Data_atlas1 = scio.loadmat("./ABIDEdata/pcc_correlation_871_cc200_.mat")
+X = Data_atlas1["connectivity"]
+Y = np.loadtxt("./ABIDEdata/871_label_cc200.txt").astype(np.int64)
 
 Nodes_Atlas1 = X.shape[-1]
 
-where_are_nan = np.isnan(X)
-where_are_inf = np.isinf(X)
+finite_mask = np.isfinite(X)
+normal_subject_mask = Y == 0
+reference_X = X[normal_subject_mask] if np.any(normal_subject_mask) else X
+reference_finite_mask = np.isfinite(reference_X)
+mean_connectivity = np.nanmean(np.where(reference_finite_mask, reference_X, np.nan), axis=0)
+mean_connectivity = np.nan_to_num(mean_connectivity, nan=0.0, posinf=0.0, neginf=0.0)
+X = np.where(finite_mask, X, mean_connectivity[np.newaxis, :, :])
 
-where_are_nan = np.isnan(X)
-where_are_inf = np.isinf(X)
-for bb in range(0, N_subjects):
-    for i in range(0, Nodes_Atlas1):
-        for j in range(0, Nodes_Atlas1):
-            if where_are_nan[bb][i][j]:
-                X[bb][i][j] = 0
-            if where_are_inf[bb][i][j]:
-                X[bb][i][j] = 1
-
-# 转换数据以适应 NodeFormer
-# 构建邻接矩阵和特征矩阵
-adj_matrices = []  # 存储每个样本的邻接矩阵
-feature_matrices = []  # 存储每个样本的特征矩阵
-
-def matrix_to_graph(matrix, label,threshold=0.2):
-    num_nodes = matrix.shape[0]
-    edge_index = []
-    edge_weight = []
-
-    for i in range(num_nodes):
-        for j in range(i + 1, num_nodes):  # 只考虑上三角矩阵
-            if abs(matrix[i, j]) > threshold:  # 使用阈值
-                edge_index.append([i, j])
-                edge_weight.append(matrix[i, j])
-
-    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
-    edge_weight = torch.tensor(edge_weight, dtype=torch.float)
-
-    x = torch.eye(num_nodes)  # 使用单位矩阵作为特征
-    # 添加标签
-    y = torch.tensor([int(label)], dtype=torch.long)
-
-    data = Data(x=x, edge_index=edge_index, edge_attr=edge_weight, y=y)
-    return data
-
-graphs = [matrix_to_graph(matrix,label, threshold=0.2) for matrix, label in zip(X, Y)]
-
-print('---------------------')
-print('X Atlas1:', X.shape)
-print('Y Atlas1:', Y.shape)
-print('Graphs:', len(graphs))
-print('---------------------')
-
-'''
-    超参数      
-'''
+print("---------------------")
+print("X Atlas1:", X.shape)
+print("Y Atlas1:", Y.shape)
+print("---------------------")
 
 epochs = 30
 batch_size = 32
 dropout = 0.5
-lr = 0.005
+lr = 1e-4
 decay = 0.01
+outer_folds = 10
+val_ratio = 0.1
+early_stop_patience = 10
+early_stop_min_delta = 1e-4
+graph_threshold = 0.2
+
 result = []
-acc_final = 0
+acc_final = 0.0
 result_final = []
 model_dim = 32
-in_channels = 200  # 根据你的数据调整
-out_channels = 2   # 输出类别数
-hidden_channels = 32  # 隐藏层通道数
-num_heads = 2  # 多头注意力机制的头数
+num_heads = 2
 num_layers_former = 3
 num_layers_gnn = 2
-
-
-# input_dim = Nodes_Atlas1 * Nodes_Atlas1
 input_dim = Nodes_Atlas1
+time_train_list = []
 
-
-
-'''
-    模型训练
-'''
-from sklearn.model_selection import KFold
 start_time = time.time()
-for ind in range(1):
-    setup_seed(ind)
+for run_idx in range(1):
+    setup_seed(run_idx)
 
     nodes_number = Nodes_Atlas1
     nums = np.ones(Nodes_Atlas1)
-    nums[:Nodes_Atlas1 - nodes_number] = 0
+    nums[: Nodes_Atlas1 - nodes_number] = 0
     np.random.seed(1)
     np.random.shuffle(nums)
-    Mask = nums.reshape(nums.shape[0], 1) * nums
-    Masked_X = X * Mask
-    J = nodes_number
-    for i in range(0, J):
-        ind = i
-        if nums[ind] == 0:
-            for j in range(J, Nodes_Atlas1):
+    mask = nums.reshape(nums.shape[0], 1) * nums
+    masked_X = X * mask
+    j_bound = nodes_number
+    for i in range(0, j_bound):
+        idx = i
+        if nums[idx] == 0:
+            for j in range(j_bound, Nodes_Atlas1):
                 if nums[j] == 1:
-                    Masked_X[:, [ind, j], :] = Masked_X[:, [j, ind], :]
-                    Masked_X[:, :, [ind, j]] = Masked_X[:, :, [j, ind]]
-                    J = j + 1
+                    masked_X[:, [idx, j], :] = masked_X[:, [j, idx], :]
+                    masked_X[:, :, [idx, j]] = masked_X[:, :, [j, idx]]
+                    j_bound = j + 1
                     break
 
-    Masked_X = Masked_X[:, :nodes_number, :nodes_number]
-    X = Masked_X
+    masked_X = masked_X[:, :nodes_number, :nodes_number]
+    X = masked_X
+    graphs = build_graphs(X, Y, threshold=graph_threshold)
 
-    acc_all = 0
-    kf = KFold(n_splits=10, shuffle=True)
-    kfold_index = 0
-    for trainval_index, test_index in kf.split(X, Y):
-        kfold_index += 1
+    acc_all = 0.0
+    kf = KFold(n_splits=outer_folds, shuffle=True, random_state=42)
+    for kfold_index, (trainval_index, test_index) in enumerate(kf.split(X, Y), start=1):
+        time_train_start = time.time()
+        print("kfold_index:", kfold_index)
 
-        print('kfold_index:', kfold_index)
+        train_idx, val_idx = train_test_split(
+            trainval_index,
+            test_size=val_ratio,
+            random_state=42 + kfold_index,
+            stratify=Y[trainval_index],
+        )
 
-        # X_trainval, X_test = X[trainval_index], X[test_index]
-        # Y_trainval, Y_test = Y[trainval_index], Y[test_index]
-        # 将数据分割为训练集和测试集
-        train_graphs = [graphs[i] for i in trainval_index]
+        train_graphs = [graphs[i] for i in train_idx]
+        val_graphs = [graphs[i] for i in val_idx]
         test_graphs = [graphs[i] for i in test_index]
 
-        # 使用 PyTorch Geometric 的 DataLoader 来批量处理图数据
         train_loader = DataLoader(train_graphs, batch_size=batch_size, shuffle=True)
-        test_loader = DataLoader(test_graphs, batch_size=batch_size)
+        val_loader = DataLoader(val_graphs, batch_size=batch_size, shuffle=False)
+        test_loader = DataLoader(test_graphs, batch_size=batch_size, shuffle=False)
 
-        # for train_index, val_index in kf.split(X_trainval, Y_trainval):
-        #     # 取消验证集
-        #     X_train, X_val = X_trainval[:], X_trainval[:]
-        #     Y_train, Y_val = Y_trainval[:], Y_trainval[:]
+        print("train_graphs", len(train_graphs))
+        print("val_graphs", len(val_graphs))
+        print("test_graphs", len(test_graphs))
+        print("train_loader", len(train_loader))
+        print("val_loader", len(val_loader))
+        print("test_loader", len(test_loader))
 
-        # print('X_train', X_train.shape)
-        # print('X_test', X_test.shape)
-        # print('Y_train', Y_train.shape)
-        # print('Y_test', Y_test.shape)
-        print('train_graphs', len(train_graphs))
-        print('test_graphs', len(test_graphs))
-        print('train_loader', len(train_loader))
-        print('test_loader', len(test_loader))
-
-        # model = SimpleTransformerModel(input_dim, model_dim, num_classes=2)
-        # model = NodeFormer(input_dim, model_dim, out_channels=2 )
-        # model = NodeFormer(
-        #     in_channels=input_dim,  # 输入特征维度
-        #     hidden_channels=model_dim,  # 隐藏层特征维度
-        #     out_channels=2,  # 输出特征维度，对应于分类任务的类别数
-        #     num_layers=3,  # Transformer 层的数量
-        #     num_heads=4,  # 注意力头的数量
-        #     dropout=0.5,  # Dropout 比率
-        #     # 其他参数保持默认
-        # )
         model = SGFormer(
-            in_channels=input_dim,  # 输入特征维度
-            hidden_channels=model_dim,  # 隐藏层特征维度
-            out_channels=2,  # 输出特征维度，对应于分类任务的类别数
-            trans_num_layers=num_layers_former,  # Transformer 层的数量
-            trans_num_heads=num_heads,  # 注意力头的数量
-            trans_dropout=0.5,  # Dropout 比率
-            gnn_num_layers=num_layers_gnn,  # GNN 层的数量
-            # 其他参数保持默认
+            in_channels=input_dim,
+            hidden_channels=model_dim,
+            out_channels=2,
+            trans_num_layers=num_layers_former,
+            trans_num_heads=num_heads,
+            trans_dropout=dropout,
+            gnn_num_layers=num_layers_gnn,
         )
         model.to(device)
-        # optimizer = optim.SGD(model.parameters(), lr=lr, weight_decay=decay, momentum=0.9, nesterov=True)
-        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=decay)
-        # scheduler = lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.9)  # 每30个epochs将学习率乘以0.1
-        # scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0.0001)
 
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=decay)
+        scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
         loss_fn = nn.CrossEntropyLoss()
+
+        best_val_loss = float("inf")
+        best_state_dict = copy.deepcopy(model.state_dict())
+        epochs_no_improve = 0
+
         for epoch in range(1, epochs + 1):
             model.train()
-            loss_train = 0
-            for data in train_loader:  # 使用 DataLoader
+            train_loss_sum = 0.0
+            train_sample_count = 0
+
+            for data in train_loader:
                 data = data.to(device)
                 optimizer.zero_grad()
-                # outputs = model(data.x, data.edge_index, data.edge_attr)
-                outputs = model(data.x, data.edge_index,data.batch)
+                outputs = model(data.x, data.edge_index, data.batch)
                 loss = loss_fn(outputs, data.y)
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-                loss_train += loss.item()
-            loss_train /= len(train_loader)
-            if epoch % 10 == 0:
-                print('epoch:', epoch, 'train loss:', loss_train)
-            # scheduler.step()
-            # val
-            if epoch % 1 == 0:
-                model.eval()
-                correct = 0
-                for data in test_loader:
-                    data = data.to(device)
-                    outputs = model(data.x, data.edge_index, data.batch)
-                    _, predicted = torch.max(outputs, 1)
-                    correct += (predicted == data.y).sum().item()
-                acc = correct / len(test_loader.dataset)
-                print('Test acc', acc)
 
-        # Create directory if it doesn't exist
-        os.makedirs('./modelsnf', exist_ok=True)
-        torch.save(model.state_dict(), './modelsnf/' + str(kfold_index) + '.pt')
+                batch_graphs = data.num_graphs
+                train_loss_sum += loss.item() * batch_graphs
+                train_sample_count += batch_graphs
+
+            train_loss = train_loss_sum / max(train_sample_count, 1)
+            val_loss, val_acc = evaluate(model, val_loader, loss_fn, device)
+
+            if epoch % 5 == 0 or epoch == 1:
+                print(
+                    "epoch:",
+                    epoch,
+                    "train loss:",
+                    train_loss,
+                    "val loss:",
+                    val_loss,
+                    "val acc:",
+                    val_acc,
+                )
+
+            if val_loss < best_val_loss - early_stop_min_delta:
+                best_val_loss = val_loss
+                best_state_dict = copy.deepcopy(model.state_dict())
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= early_stop_patience:
+                    print(f"Early stopping at epoch {epoch}, best val loss: {best_val_loss:.6f}")
+                    break
+
+            scheduler.step()
+
+        model.load_state_dict(best_state_dict)
+        test_loss, acc = evaluate(model, test_loader, loss_fn, device)
+        print("Test loss", test_loss, "Test acc", acc)
+
+        os.makedirs("./modelsnf", exist_ok=True)
+        torch.save(model.state_dict(), "./modelsnf/" + str(kfold_index) + ".pt")
         result.append([kfold_index, acc])
         acc_all += acc
 
-    temp = acc_all / 10
+        time_train_end = time.time()
+        time_train_list.append(time_train_end - time_train_start)
+
+    temp = acc_all / outer_folds
     acc_final += temp
     result_final.append(temp)
-    ACC = acc_final / 10
+    ACC = acc_final / len(result_final)
     print(result)
+
 end_time = time.time()
 print(result_final)
-print(acc_final)
-# 总训练时间
-total_train_time = end_time - start_time
-print(f"Total training time: {total_train_time:.2f} seconds")
-
+print(ACC)
+print(f"Total training time: {end_time - start_time:.2f} seconds")
+print(f"Ave fold training time: {np.mean(time_train_list):.2f} seconds")
