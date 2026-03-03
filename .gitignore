@@ -1,3 +1,12 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+# system files
+.DS_Store
+
 # 数据集
 
 ABIDEdata/*.txt
@@ -20,3 +29,5 @@ venv/
 *.bbl
 *.blg
 *.toc
+
+output/

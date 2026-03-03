@@ -1,10 +1,11 @@
 import torch.nn as nn
-import torch.nn.functional as F
 import torch
 import torch.optim as optim
 import numpy as np
 import random
+import copy
 from sklearn import metrics
+from sklearn.model_selection import KFold, train_test_split
 import scipy.io as scio
 import time
 import os
@@ -89,8 +90,6 @@ class Model(nn.Module):
         x = self.n2g(x)
         x = x.view(x.size(0), -1)
         x = self.linear(x)
-        x = F.softmax(x, dim=-1)
-
         return x, None
 
 '''
@@ -100,22 +99,17 @@ class Model(nn.Module):
 print('loading ABIDE data...')
 Data_atlas1 = scio.loadmat('./ABIDEdata/pcc_correlation_871_cc200_.mat')
 X = Data_atlas1['connectivity']
-Y = np.loadtxt('./ABIDEdata/871_label_cc200.txt')
+Y = np.loadtxt('./ABIDEdata/871_label_cc200.txt').astype(np.int64)
 
 Nodes_Atlas1 = X.shape[-1]
 
-where_are_nan = np.isnan(X)
-where_are_inf = np.isinf(X)
-
-where_are_nan = np.isnan(X)
-where_are_inf = np.isinf(X)
-for bb in range(0, N_subjects):
-    for i in range(0, Nodes_Atlas1):
-        for j in range(0, Nodes_Atlas1):
-            if where_are_nan[bb][i][j]:
-                X[bb][i][j] = 0
-            if where_are_inf[bb][i][j]:
-                X[bb][i][j] = 1
+finite_mask = np.isfinite(X)
+normal_subject_mask = (Y == 0)
+reference_X = X[normal_subject_mask] if np.any(normal_subject_mask) else X
+reference_finite_mask = np.isfinite(reference_X)
+mean_connectivity = np.nanmean(np.where(reference_finite_mask, reference_X, np.nan), axis=0)
+mean_connectivity = np.nan_to_num(mean_connectivity, nan=0.0, posinf=0.0, neginf=0.0)
+X = np.where(finite_mask, X, mean_connectivity[np.newaxis, :, :])
 
 print('---------------------')
 print('X Atlas1:', X.shape)
@@ -131,6 +125,10 @@ batch_size = 64
 dropout = 0.5
 lr = 0.005
 decay = 0.01
+outer_folds = 10
+val_ratio = 0.1
+early_stop_patience = 10
+early_stop_min_delta = 1e-4
 result = []
 acc_final = 0
 result_final = []
@@ -138,11 +136,9 @@ result_final = []
 '''
     模型训练
 '''
-from sklearn.model_selection import KFold
 time_train_list = []
-time_data_load_end = time.time()
-for ind in range(1):
-    setup_seed(ind)
+for run_idx in range(1):
+    setup_seed(run_idx)
 
     nodes_number = Nodes_Atlas1
     nums = np.ones(Nodes_Atlas1)
@@ -166,43 +162,44 @@ for ind in range(1):
     X = Masked_X
 
     acc_all = 0
-    kf = KFold(n_splits=10, shuffle=True)
-    kfold_index = 0
-    for trainval_index, test_index in kf.split(X, Y):
-        kfold_index += 1
+    kf = KFold(n_splits=outer_folds, shuffle=True, random_state=42)
+    for kfold_index, (trainval_index, test_index) in enumerate(kf.split(X, Y), start=1):
         time_train_start = time.time()
         print('kfold_index:', kfold_index)
 
         X_trainval, X_test = X[trainval_index], X[test_index]
         Y_trainval, Y_test = Y[trainval_index], Y[test_index]
 
-        for train_index, val_index in kf.split(X_trainval, Y_trainval):
-            # 取消验证集
-            X_train, X_val = X_trainval[:], X_trainval[:]
-            Y_train, Y_val = Y_trainval[:], Y_trainval[:]
+        X_train, X_val, Y_train, Y_val = train_test_split(
+            X_trainval,
+            Y_trainval,
+            test_size=val_ratio,
+            random_state=42 + kfold_index,
+            stratify=Y_trainval,
+        )
 
         print('X_train', X_train.shape)
+        print('X_val', X_val.shape)
         print('X_test', X_test.shape)
         print('Y_train', Y_train.shape)
+        print('Y_val', Y_val.shape)
         print('Y_test', Y_test.shape)
 
         model = Model(dropout=dropout, num_class=2)
         model.to(device)
         optimizer = optim.SGD(model.parameters(), lr=lr, weight_decay=decay, momentum=0.9, nesterov=True)
         loss_fn = nn.CrossEntropyLoss()
+        best_val_loss = float('inf')
+        best_state_dict = copy.deepcopy(model.state_dict())
+        epochs_no_improve = 0
 
         for epoch in range(1, epochs + 1):
             model.train()
 
             idx_batch = np.random.permutation(int(X_train.shape[0]))
-            num_batch = X_train.shape[0] // int(batch_size)
-
-            loss_train = 0
-            for bn in range(num_batch):
-                if bn == num_batch - 1:
-                    batch = idx_batch[bn * int(batch_size):]
-                else:
-                    batch = idx_batch[bn * int(batch_size): (bn + 1) * int(batch_size)]
+            loss_train_list = []
+            for start in range(0, X_train.shape[0], int(batch_size)):
+                batch = idx_batch[start:start + int(batch_size)]
                 train_data_batch = X_train[batch]
                 train_label_batch = Y_train[batch]
 
@@ -213,34 +210,54 @@ for ind in range(1):
                 outputs, rec = model(train_data_batch_dev)
                 loss1 = loss_fn(outputs, train_label_batch_dev)
                 loss = loss1
-                loss_train += loss
+                loss_train_list.append(loss.item())
                 loss.backward()
                 optimizer.step()
 
-            loss_train /= num_batch
-            if epoch % 10 == 0:
-                print('epoch:', epoch, 'train loss:', loss_train.item())
+            loss_train = float(np.mean(loss_train_list)) if loss_train_list else 0.0
 
-            # val
-            if epoch % 1 == 0:
-                model.eval()
-                test_data_batch_dev = torch.from_numpy(X_test).float().to(device)
-                outputs, _= model(test_data_batch_dev)
-                _, indices = torch.max(outputs, dim=1)
-                preds = indices.cpu()
-                acc = metrics.accuracy_score(preds, Y_test)
-                print('Test acc', acc)
+            model.eval()
+            with torch.no_grad():
+                val_data_batch_dev = torch.from_numpy(X_val).float().to(device)
+                val_label_batch_dev = torch.from_numpy(Y_val).long().to(device)
+                val_outputs, _ = model(val_data_batch_dev)
+                val_loss = loss_fn(val_outputs, val_label_batch_dev).item()
+                val_preds = torch.argmax(val_outputs, dim=1).cpu().numpy()
+                val_acc = metrics.accuracy_score(Y_val, val_preds)
+
+            if epoch % 5 == 0 or epoch == 1:
+                print('epoch:', epoch, 'train loss:', loss_train, 'val loss:', val_loss, 'val acc:', val_acc)
+
+            if val_loss < best_val_loss - early_stop_min_delta:
+                best_val_loss = val_loss
+                best_state_dict = copy.deepcopy(model.state_dict())
+                epochs_no_improve = 0
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= early_stop_patience:
+                    print(f'Early stopping at epoch {epoch}, best val loss: {best_val_loss:.6f}')
+                    break
+
+        model.load_state_dict(best_state_dict)
+        model.eval()
+        with torch.no_grad():
+            test_data_batch_dev = torch.from_numpy(X_test).float().to(device)
+            test_outputs, _ = model(test_data_batch_dev)
+            test_preds = torch.argmax(test_outputs, dim=1).cpu().numpy()
+            acc = metrics.accuracy_score(Y_test, test_preds)
+            print('Test acc', acc)
+
         os.makedirs('./models', exist_ok=True)
         torch.save(model.state_dict(), './models/' + str(kfold_index) + '.pt')
         result.append([kfold_index, acc])
         acc_all += acc
         time_train_end = time.time()
         time_train_list.append(time_train_end - time_train_start)
-    temp = acc_all / 10
+    temp = acc_all / outer_folds
     acc_final += temp
     result_final.append(temp)
-    ACC = acc_final / 10
+    ACC = acc_final / len(result_final)
     print(result)
 print(result_final)
-print(acc_final)
+print(ACC)
 print(f"Ave Training Time: {np.mean(time_train_list)} seconds")
