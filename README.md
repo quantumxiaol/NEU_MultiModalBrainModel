@@ -118,3 +118,76 @@ cat .env.template > .env
 ```
 
 我完成原始的任务在Windows上运行的，设备为intel i9-13900HX+nVidia RTX 4080 Laptop，在WSL、ubuntu上验证了可以运行。后面更新了环境，确认了在mac OS（M4 Pro）上可以使用mps计算。
+
+## 后记
+
+改这个早已完结的项目，就像柯西展示了他关于级数收敛性的新理论后，拉普拉斯拿着柯西的判别法，逐一检查《天体力学》中用到的每一个级数。
+
+Transformer 的计算，出现序列长度坍缩（Sequence Length Collapse）导致自注意力机制失效。
+模型实际上变成了一个拥有 40,000 个输入维度的深层 MLP。
+40,000 维的特征空间对于 871 个样本来说太“宽阔”了。模型通过极其复杂的非线性映射，轻而易举地在训练集里画出了分类界线。
+acc为0.677273，4% 的提升让我觉得“Transformer 的全局建模能力起作用了”，但实际上，似乎这只是深度模型靠参数量硬堆出来的拟合能力。
+
+我把Transformer的实现改过了，原来是“超图的节点”作为Token，现在是一个脑区对应一个Token。同时添加attention map的实现。
+
+学长一开始给我的那个就有点问题，十折平均、取消验证集、只有训练集测试集，带有数据泄露的隐患。初衷是医学数据太少了，再划出去验证集会导致训练的数据更少。现在划分验证集，并采用早停。
+
+鉴于只有871个数据，传统模型如RF、SVM自然会表现更好一点。
+
+### 新的实验数据
+
+cc200上不同模型的表现
+
+|模型|cnn|simpletf|sgformer|
+|-|-|-|-|
+|acc|0.6543887147335424|0.5866118077324974|0.5326541274817137|
+|time|65.907|10.72|138.06|
+
+
+transformer在不同模版上的表现
+
+|模版|aal|cc200|cc400|dos|ez|ho|tt|
+|-|-|-|-|-|-|-|-|
+|acc|0.5992816091954023|0.5866118077324974|0.6221525600835947|0.5658699059561129|0.6130485893416927|0.6107628004179728|0.591274817136886|
+|time|18.03|10.72|32.5754|19.51|12.53|12.36|11.05|
+
+cc400不同模型的表现
+
+|模型|cnn|simpletf|Graphformer|SVM|RF|
+|-|-|-|-|-|-|
+|acc|0.5797283176593522|0.6221525600835947|0.6061128526645769|0.6877220480668758|0.6406217345872518
+|Recall|0.5789179140639468|0.6175845711335227|0.6025647274745152|0.6807686136634227|0.6254032048316311
+|F1|0.5492135948553313|0.6074994223101176|0.5822445560834322|0.6810094433921405|0.6120624153427312
+|AUC|0.6409376097932221|0.6599171124896835|0.646700622967953|0.7480032103343304|0.6942460306639439|
+time|258.03|24.1288|143.31|442.54|7.186|
+
+cc400上Transformer的attention map。
+
+![asd_mean_last_laye](./png/cc400tf_attention_map/asd_mean_last_layer_global.png "asd_mean_last_laye")
+![hc_mean_last_layer](./png/cc400tf_attention_map/hc_mean_last_layer_global.png "hc_mean_last_layer")
+
+以看到明显的纵向和横向条纹。某些特定的脑区（对应的 Index）充当了“信息枢纽（Hubs）”。模型在做最终决定时，会反复向这些脑区“提问”（Query）或者从它们那里“提取信息”（Key）。
+
+
+![asd_mean_rollout](./png/cc400tf_attention_map/asd_mean_rollout_global.png "asd_mean_rollout")
+![hc_mean_rollout](./png/cc400tf_attention_map/hc_mean_rollout_global.png "hc_mean_rollout")
+
+有一条极亮的对角线。这代表自注意力（Self-attention）占主导，即模型认为每个脑区自身的连接特征（与全脑的 Profile）是识别疾病的最稳健特征。
+
+
+![asd_minus_hc_last_layer](./png/cc400tf_attention_map/asd_minus_hc_last_layer_global.png "asd_minus_hc_last_layer")
+![asd_minus_hc_rollout](./png/cc400tf_attention_map/asd_minus_hc_rollout_global.png "asd_minus_hc_rollout")
+
+红色代表 ASD 比 HC 受到模型更多关注的连接，蓝色则相反。图中的红色斑点是模型眼中的“自闭症特异性连接”。
+
+
+集成模型的表现
+||cc400+aal+ez|
+|-|-|
+|acc|0.5981060606060605|
+|Recall|0.5997984589697886|
+|F1|0.5733345386475863|
+|AUC|0.6734767942961576|
+|time|36.392|
+
+通过集成模型，AUC能力有了提升，说明确实提升了模型的泛化和分类能力。

@@ -9,8 +9,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 from sklearn.metrics import accuracy_score, f1_score, recall_score, roc_auc_score
+from sklearn.manifold import TSNE
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.optim import lr_scheduler
 
@@ -51,8 +55,95 @@ def load_modality(name, atlas_path, label_path):
     return data, labels
 
 
+def save_tsne_plot(embeddings, labels, output_path, title):
+    if embeddings.shape[0] < 3:
+        return
+
+    perplexity = min(30, embeddings.shape[0] - 1)
+    perplexity = max(2, perplexity)
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        random_state=42,
+        init="random",
+        learning_rate="auto",
+    )
+    emb_2d = tsne.fit_transform(embeddings)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+    unique_labels = sorted(np.unique(labels))
+    label_name = {0: "HC", 1: "ASD"}
+    colors = {0: "tab:blue", 1: "tab:orange"}
+    for label_value in unique_labels:
+        idx = labels == label_value
+        ax.scatter(
+            emb_2d[idx, 0],
+            emb_2d[idx, 1],
+            s=20,
+            alpha=0.8,
+            c=colors.get(int(label_value), "tab:gray"),
+            label=label_name.get(int(label_value), f"label_{int(label_value)}"),
+        )
+    ax.set_title(title)
+    ax.set_xlabel("t-SNE dim 1")
+    ax.set_ylabel("t-SNE dim 2")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=300)
+    plt.close(fig)
+
+
+def save_fold_audit(
+    output_root,
+    fold_index,
+    labels,
+    sim_weights,
+    diff_weights,
+    similarity_embeddings,
+    difference_embeddings,
+    modality_names,
+):
+    fold_dir = os.path.join(output_root, f"fold_{fold_index:02d}")
+    os.makedirs(fold_dir, exist_ok=True)
+
+    labels = np.asarray(labels)
+    sim_weights = np.asarray(sim_weights)
+    diff_weights = np.asarray(diff_weights)
+
+    lines = ["group,branch,modality,mean_weight"]
+    groups = [("all", None), ("ASD", 1), ("HC", 0)]
+    for group_name, group_label in groups:
+        if group_label is None:
+            idx = np.arange(labels.shape[0])
+        else:
+            idx = np.where(labels == group_label)[0]
+        if idx.size == 0:
+            continue
+        sim_mean = sim_weights[idx].mean(axis=0)
+        diff_mean = diff_weights[idx].mean(axis=0)
+        for modality_idx, modality_name in enumerate(modality_names):
+            lines.append(f"{group_name},similarity,{modality_name},{sim_mean[modality_idx]:.8f}")
+            lines.append(f"{group_name},difference,{modality_name},{diff_mean[modality_idx]:.8f}")
+
+    with open(os.path.join(fold_dir, "modality_gate_weights.csv"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    save_tsne_plot(
+        similarity_embeddings,
+        labels,
+        os.path.join(fold_dir, "tsne_similarity.png"),
+        f"Fold {fold_index} Similarity Branch t-SNE",
+    )
+    save_tsne_plot(
+        difference_embeddings,
+        labels,
+        os.path.join(fold_dir, "tsne_difference.png"),
+        f"Fold {fold_index} Difference Branch t-SNE",
+    )
+
+
 class MultiModalBrainModel(nn.Module):
-    # 保持集成模型结构不变
+    # 保持集成模型思想不变，融合层简化为稳定的模态拼接
     def __init__(self, models, fusion_dim, feature_dim, num_classes, model_dim, num_heads=2, num_layers=2, dropout=0.5):
         super().__init__()
         self.models = nn.ModuleList(models)
@@ -60,99 +151,133 @@ class MultiModalBrainModel(nn.Module):
 
         # 将每个模态输出作为一个token: [B, M, D]
         self.token_proj = nn.Linear(feature_dim, model_dim) if feature_dim != model_dim else nn.Identity()
-
-        sim_layer = nn.TransformerEncoderLayer(
-            d_model=model_dim,
-            nhead=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        diff_layer = nn.TransformerEncoderLayer(
-            d_model=model_dim,
-            nhead=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.similarity_transformer = nn.TransformerEncoder(sim_layer, num_layers=num_layers)
-        self.difference_transformer = nn.TransformerEncoder(diff_layer, num_layers=num_layers)
+        stacked_dim = model_dim * self.num_modalities
 
         self.similarity_encoder = nn.Sequential(
-            nn.LayerNorm(model_dim),
+            nn.LayerNorm(stacked_dim),
+            nn.Linear(stacked_dim, fusion_dim),
             nn.ReLU(),
-            nn.Linear(model_dim, fusion_dim),
+            nn.Dropout(dropout),
         )
 
         self.difference_encoder = nn.Sequential(
-            nn.LayerNorm(model_dim),
+            nn.LayerNorm(stacked_dim),
+            nn.Linear(stacked_dim, fusion_dim),
             nn.ReLU(),
-            nn.Linear(model_dim, fusion_dim),
+            nn.Dropout(dropout),
         )
 
         self.classifier = nn.Linear(fusion_dim, num_classes)
 
-    def forward(self, x_list, return_branch_outputs=False):
+    def forward(self, x_list, return_branch_outputs=False, return_gate_weights=False):
         model_outputs = [model(x) for model, x in zip(self.models, x_list)]
         # [B, M, feature_dim]
         modality_tokens = torch.stack(model_outputs, dim=1)
         modality_tokens = self.token_proj(modality_tokens)
+        stacked_tokens = modality_tokens.reshape(modality_tokens.size(0), -1)
+        uniform_weights = torch.full(
+            (modality_tokens.size(0), self.num_modalities),
+            fill_value=1.0 / self.num_modalities,
+            device=modality_tokens.device,
+            dtype=modality_tokens.dtype,
+        )
 
-        sim_tokens = self.similarity_transformer(modality_tokens)
-        diff_tokens = self.difference_transformer(modality_tokens)
-
-        similarity = self.similarity_encoder(sim_tokens.mean(dim=1))
-        difference = self.difference_encoder(diff_tokens.mean(dim=1))
+        similarity = self.similarity_encoder(stacked_tokens)
+        difference = self.difference_encoder(stacked_tokens)
         class_output = self.classifier(similarity)
+        if return_branch_outputs and return_gate_weights:
+            return (
+                class_output,
+                similarity,
+                difference,
+                model_outputs,
+                uniform_weights,
+                uniform_weights,
+            )
         if return_branch_outputs:
             return class_output, similarity, difference, model_outputs
+        if return_gate_weights:
+            return class_output, similarity, difference, uniform_weights, uniform_weights
         return class_output, similarity, difference
 
 
-def similarity_loss(output_list, alpha=0.5):
-    cos = nn.CosineSimilarity(dim=1, eps=1e-6)
+def rbf_kernel_matrix(x, y, sigma):
+    x_sq = (x * x).sum(dim=1, keepdim=True)
+    y_sq = (y * y).sum(dim=1, keepdim=True)
+    dist_sq = x_sq - 2.0 * torch.matmul(x, y.t()) + y_sq.t()
+    dist_sq = torch.clamp(dist_sq, min=0.0)
+    return torch.exp(-dist_sq / (2.0 * sigma * sigma))
+
+
+def mmd_rbf(x, y, sigmas=(0.5, 1.0, 2.0, 4.0)):
+    loss = 0.0
+    for sigma in sigmas:
+        k_xx = rbf_kernel_matrix(x, x, sigma)
+        k_yy = rbf_kernel_matrix(y, y, sigma)
+        k_xy = rbf_kernel_matrix(x, y, sigma)
+        loss = loss + (k_xx.mean() + k_yy.mean() - 2.0 * k_xy.mean())
+    return torch.clamp(loss / len(sigmas), min=0.0)
+
+
+def similarity_loss(output_list, alpha=0.8, sigmas=(0.5, 1.0, 2.0, 4.0)):
+    # 用MMD做分布对齐，而不是强制向量点对点相同
     normalized_outputs = [F.normalize(out, p=2, dim=1) for out in output_list]
     loss = 0.0
-    n = len(normalized_outputs)
     count = 0
-    for i in range(n):
-        for j in range(i + 1, n):
-            sim = cos(normalized_outputs[i], normalized_outputs[j])
-            loss += (1 - sim).mean()
+    for i in range(len(normalized_outputs)):
+        for j in range(i + 1, len(normalized_outputs)):
+            loss = loss + mmd_rbf(normalized_outputs[i], normalized_outputs[j], sigmas=sigmas)
             count += 1
     return alpha * (loss / max(count, 1))
 
 
-class InfoNCELoss(nn.Module):
-    def __init__(self, temperature=0.2):
+def center_kernel_matrix(kernel):
+    n = kernel.size(0)
+    eye = torch.eye(n, device=kernel.device, dtype=kernel.dtype)
+    one = torch.ones((n, n), device=kernel.device, dtype=kernel.dtype) / n
+    h = eye - one
+    return h @ kernel @ h
+
+
+def hsic_rbf(x, y, sigma=1.0):
+    # Normalized HSIC: Tr(KH L H) / (||KH||_F * ||LH||_F)
+    if x.size(0) <= 1:
+        return x.new_tensor(0.0)
+
+    kx = rbf_kernel_matrix(x, x, sigma)
+    ky = rbf_kernel_matrix(y, y, sigma)
+    kx = center_kernel_matrix(kx)
+    ky = center_kernel_matrix(ky)
+    numerator = torch.trace(kx @ ky)
+    denominator = torch.sqrt(torch.trace(kx @ kx) * torch.trace(ky @ ky) + 1e-12)
+    hsic = numerator / denominator
+    return torch.clamp(hsic, min=0.0)
+
+
+def difference_loss(output_list, beta=0.01, sigma=1.0):
+    # 最小化HSIC，推动不同模态学到统计独立的互补信息
+    normalized_outputs = [F.normalize(out, p=2, dim=1) for out in output_list]
+    loss = 0.0
+    count = 0
+    for i in range(len(normalized_outputs)):
+        for j in range(i + 1, len(normalized_outputs)):
+            loss = loss + hsic_rbf(normalized_outputs[i], normalized_outputs[j], sigma=sigma)
+            count += 1
+    return beta * (loss / max(count, 1))
+
+
+class UncertaintyWeighting(nn.Module):
+    # Keep classification as the primary objective, adapt only sim/diff terms
+    # L = L_cls + exp(-s1)L_sim + exp(-s2)L_diff + 0.5(s1+s2), where s=log(sigma^2)
+    def __init__(self, num_losses=2):
         super().__init__()
-        self.temperature = temperature
-        self.cosine_similarity = nn.CosineSimilarity(dim=-1)
+        self.log_vars = nn.Parameter(torch.zeros(num_losses))
 
-    def forward(self, anchor, positive, negatives):
-        # anchor: [B, D], positive: [B, D], negatives: [B, Nneg, D]
-        anchor = F.normalize(anchor, p=2, dim=1).unsqueeze(1)  # [B, 1, D]
-        positive = F.normalize(positive, p=2, dim=1).unsqueeze(1)  # [B, 1, D]
-        if negatives.dim() == 2:
-            negatives = negatives.unsqueeze(1)
-        if negatives.dim() != 3:
-            raise ValueError(f"negatives must be [B, Nneg, D], got shape {negatives.shape}")
-        negatives = F.normalize(negatives, p=2, dim=2)
-
-        pos_logits = self.cosine_similarity(anchor, positive) / self.temperature  # [B, 1]
-        neg_logits = self.cosine_similarity(anchor, negatives) / self.temperature  # [B, Nneg]
-        logits = torch.cat([pos_logits, neg_logits], dim=1)  # [B, 1+Nneg]
-        targets = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
-        loss = F.cross_entropy(logits, targets)
-        return loss
-
-
-def build_infonce_negatives(positive_modal, aux_modal):
-    # 构造多负样本: 仅使用跨受试者负样本，避免与相似性损失直接冲突
-    # 输出: [B, Nneg, D]
-    if positive_modal.size(0) <= 1:
-        return aux_modal.unsqueeze(1)
-    neg1 = torch.roll(positive_modal, shifts=1, dims=0)
-    neg2 = torch.roll(aux_modal, shifts=1, dims=0)
-    return torch.stack([neg1, neg2], dim=1)
+    def forward(self, class_loss, sim_loss, diff_loss):
+        log_vars = torch.clamp(self.log_vars, min=-5.0, max=5.0)
+        sim_term = torch.exp(-log_vars[0]) * sim_loss + 0.5 * log_vars[0]
+        diff_term = torch.exp(-log_vars[1]) * diff_loss + 0.5 * log_vars[1]
+        return class_loss + sim_term + diff_term
 
 
 def find_best_threshold(y_true, probs, num_thresholds=81):
@@ -198,17 +323,19 @@ Y = Y1
 
 epochs = 40
 batch_size = 64
+grad_accum_steps = 2
 dropout = 0.25
 lr = 1e-4
+logvar_lr = 1e-3
 decay = 0.01
 outer_folds = 10
 val_ratio = 0.1
 early_stop_patience = 10
 early_stop_min_delta = 1e-4
 
-NUM_HEADS_ez = 1
+NUM_HEADS_ez = 2
 NUM_LAYERS_ez = 1
-NUM_HEADS_aal = 1
+NUM_HEADS_aal = 2
 NUM_LAYERS_aal = 1
 NUM_HEADS_cc400 = 4
 NUM_LAYERS_cc400 = 1
@@ -218,8 +345,12 @@ NUM_LAYERS_multi = 3
 model_dim = 64
 feature_dim = 64
 fusion_dim = 64
-alpha = 0.6
-beta = 0.008
+alpha = 0.1
+beta = 0.2
+mmd_sigmas = (0.5, 1.0, 2.0, 4.0)
+hsic_sigma = 1.0
+modality_names = ["aal", "cc400", "ez"]
+audit_output_root = "./modelstfensemble8/audit"
 
 result = []
 recall_k = []
@@ -302,13 +433,19 @@ for run_idx in range(1):
             dropout=dropout,
         ).to(device)
 
-        optimizer = optim.AdamW(multi_modal_model.parameters(), lr=lr, weight_decay=decay)
+        loss_weighting = UncertaintyWeighting(num_losses=2).to(device)
+        optimizer = optim.AdamW(
+            [
+                {"params": multi_modal_model.parameters(), "lr": lr, "weight_decay": decay},
+                {"params": loss_weighting.parameters(), "lr": logvar_lr, "weight_decay": 0.0},
+            ]
+        )
         scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
         loss_fn = nn.CrossEntropyLoss()
-        infoNCE_loss_fn = InfoNCELoss()
 
         best_val_loss = float("inf")
         best_state_dict = copy.deepcopy(multi_modal_model.state_dict())
+        best_loss_weighting_state_dict = copy.deepcopy(loss_weighting.state_dict())
         epochs_no_improve = 0
 
         for epoch in range(1, epochs + 1):
@@ -325,49 +462,65 @@ for run_idx in range(1):
 
             total_loss_list = []
             class_loss_list = []
-            sim_loss_list = []
-            diff_loss_list = []
+            sim_loss_raw_list = []
+            diff_loss_raw_list = []
+            effective_step = 0
+            optimizer.zero_grad()
 
             for batch in batch_indices:
                 if batch.shape[0] <= 1:
                     continue
 
+                effective_step += 1
                 x1_batch = torch.from_numpy(X1_train[batch]).float().to(device)
                 x3_batch = torch.from_numpy(X3_train[batch]).float().to(device)
                 x5_batch = torch.from_numpy(X5_train[batch]).float().to(device)
                 y_batch = torch.from_numpy(Y_train[batch]).long().to(device)
 
-                optimizer.zero_grad()
-
-                outputs, similarity_output, difference_output, branch_outputs = multi_modal_model(
+                outputs, _, _, branch_outputs = multi_modal_model(
                     [x1_batch, x3_batch, x5_batch], return_branch_outputs=True
                 )
                 output_aal, output_cc400, output_ez = branch_outputs
 
                 class_loss = loss_fn(outputs, y_batch)
-                reg_scale = min(1.0, epoch / 10.0)
-                sim_loss = reg_scale * similarity_loss([output_aal, output_cc400, output_ez], alpha)
-                neg_for_cc400 = build_infonce_negatives(output_ez, output_aal)
-                neg_for_ez = build_infonce_negatives(output_cc400, output_aal)
-                contrast_loss = reg_scale * beta * 0.5 * (
-                    infoNCE_loss_fn(output_cc400, output_ez, neg_for_cc400)
-                    + infoNCE_loss_fn(output_ez, output_cc400, neg_for_ez)
+                sim_loss_raw = similarity_loss(
+                    [output_aal, output_cc400, output_ez],
+                    alpha=alpha,
+                    sigmas=mmd_sigmas,
                 )
-                total_loss = class_loss + sim_loss + contrast_loss
+                diff_loss_raw = difference_loss(
+                    [output_aal, output_cc400, output_ez],
+                    beta=beta,
+                    sigma=hsic_sigma,
+                )
+                total_loss = loss_weighting(class_loss, sim_loss_raw, diff_loss_raw)
 
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(multi_modal_model.parameters(), max_norm=1.0)
-                optimizer.step()
+                (total_loss / grad_accum_steps).backward()
+                if effective_step % grad_accum_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        list(multi_modal_model.parameters()) + list(loss_weighting.parameters()),
+                        max_norm=1.0,
+                    )
+                    optimizer.step()
+                    optimizer.zero_grad()
 
                 total_loss_list.append(total_loss.item())
                 class_loss_list.append(class_loss.item())
-                sim_loss_list.append(sim_loss.item())
-                diff_loss_list.append(contrast_loss.item())
+                sim_loss_raw_list.append(sim_loss_raw.item())
+                diff_loss_raw_list.append(diff_loss_raw.item())
+
+            if effective_step > 0 and effective_step % grad_accum_steps != 0:
+                torch.nn.utils.clip_grad_norm_(
+                    list(multi_modal_model.parameters()) + list(loss_weighting.parameters()),
+                    max_norm=1.0,
+                )
+                optimizer.step()
+                optimizer.zero_grad()
 
             train_loss = float(np.mean(total_loss_list)) if total_loss_list else 0.0
             train_class_loss = float(np.mean(class_loss_list)) if class_loss_list else 0.0
-            train_sim_loss = float(np.mean(sim_loss_list)) if sim_loss_list else 0.0
-            train_diff_loss = float(np.mean(diff_loss_list)) if diff_loss_list else 0.0
+            train_sim_loss = float(np.mean(sim_loss_raw_list)) if sim_loss_raw_list else 0.0
+            train_diff_loss = float(np.mean(diff_loss_raw_list)) if diff_loss_raw_list else 0.0
 
             multi_modal_model.eval()
             with torch.no_grad():
@@ -382,20 +535,23 @@ for run_idx in range(1):
                 val_output_aal, val_output_cc400, val_output_ez = val_branch_outputs
 
                 val_class_loss = loss_fn(val_outputs, y_val)
-                reg_scale = min(1.0, epoch / 10.0)
-                val_sim_loss = reg_scale * similarity_loss([val_output_aal, val_output_cc400, val_output_ez], alpha)
-                val_neg_for_cc400 = build_infonce_negatives(val_output_ez, val_output_aal)
-                val_neg_for_ez = build_infonce_negatives(val_output_cc400, val_output_aal)
-                val_contrast_loss = reg_scale * beta * 0.5 * (
-                    infoNCE_loss_fn(val_output_cc400, val_output_ez, val_neg_for_cc400)
-                    + infoNCE_loss_fn(val_output_ez, val_output_cc400, val_neg_for_ez)
+                val_sim_loss_raw = similarity_loss(
+                    [val_output_aal, val_output_cc400, val_output_ez],
+                    alpha=alpha,
+                    sigmas=mmd_sigmas,
                 )
-                val_total_loss = val_class_loss + val_sim_loss + val_contrast_loss
+                val_diff_loss_raw = difference_loss(
+                    [val_output_aal, val_output_cc400, val_output_ez],
+                    beta=beta,
+                    sigma=hsic_sigma,
+                )
+                val_total_loss = loss_weighting(val_class_loss, val_sim_loss_raw, val_diff_loss_raw)
 
                 val_preds = torch.argmax(val_outputs, dim=1).cpu().numpy()
                 val_acc = accuracy_score(Y_val, val_preds)
 
             if epoch % 5 == 0 or epoch == 1:
+                sigma_vals = torch.exp(0.5 * loss_weighting.log_vars.detach()).cpu().numpy()
                 print(
                     "epoch:",
                     epoch,
@@ -409,13 +565,22 @@ for run_idx in range(1):
                     train_diff_loss,
                     "val loss:",
                     val_total_loss.item(),
+                    "val sim:",
+                    val_sim_loss_raw.item(),
+                    "val diff:",
+                    val_diff_loss_raw.item(),
                     "val acc:",
                     val_acc,
+                    "sigma_sim:",
+                    float(sigma_vals[0]),
+                    "sigma_diff:",
+                    float(sigma_vals[1]),
                 )
 
             if val_total_loss.item() < best_val_loss - early_stop_min_delta:
                 best_val_loss = val_total_loss.item()
                 best_state_dict = copy.deepcopy(multi_modal_model.state_dict())
+                best_loss_weighting_state_dict = copy.deepcopy(loss_weighting.state_dict())
                 epochs_no_improve = 0
             else:
                 epochs_no_improve += 1
@@ -426,6 +591,7 @@ for run_idx in range(1):
             scheduler.step()
 
         multi_modal_model.load_state_dict(best_state_dict)
+        loss_weighting.load_state_dict(best_loss_weighting_state_dict)
         multi_modal_model.eval()
         with torch.no_grad():
             x1_val = torch.from_numpy(X1_val).float().to(device)
@@ -438,7 +604,9 @@ for run_idx in range(1):
             x1_test = torch.from_numpy(X1_test).float().to(device)
             x3_test = torch.from_numpy(X3_test).float().to(device)
             x5_test = torch.from_numpy(X5_test).float().to(device)
-            test_outputs, _, _ = multi_modal_model([x1_test, x3_test, x5_test])
+            test_outputs, similarity_test, difference_test, sim_gate_test, diff_gate_test = multi_modal_model(
+                [x1_test, x3_test, x5_test], return_gate_weights=True
+            )
             probs = torch.softmax(test_outputs, dim=1)[:, 1].cpu().numpy()
 
         preds = (probs >= best_threshold).astype(np.int64)
@@ -462,6 +630,25 @@ for run_idx in range(1):
 
         os.makedirs("./modelstfensemble8", exist_ok=True)
         torch.save(multi_modal_model.state_dict(), f"./modelstfensemble8/{kfold_index}.pt")
+        os.makedirs(audit_output_root, exist_ok=True)
+        save_fold_audit(
+            output_root=audit_output_root,
+            fold_index=kfold_index,
+            labels=Y_test,
+            sim_weights=sim_gate_test.cpu().numpy(),
+            diff_weights=diff_gate_test.cpu().numpy(),
+            similarity_embeddings=similarity_test.cpu().numpy(),
+            difference_embeddings=difference_test.cpu().numpy(),
+            modality_names=modality_names,
+        )
+        sim_mean = sim_gate_test.mean(dim=0).cpu().numpy()
+        diff_mean = diff_gate_test.mean(dim=0).cpu().numpy()
+        print(
+            "gate_mean(sim):",
+            {name: float(weight) for name, weight in zip(modality_names, sim_mean)},
+            "gate_mean(diff):",
+            {name: float(weight) for name, weight in zip(modality_names, diff_mean)},
+        )
 
         result.append([kfold_index, acc])
         recall_k.append([kfold_index, recall])
