@@ -1,21 +1,15 @@
-import torch.nn as nn
-import torch.nn.functional as F
-import torch
-import torch.optim as optim
-import numpy as np
-import random
-from sklearn import metrics
-from sklearn.ensemble import RandomForestClassifier
-import scipy.io as scio
-from torch.optim import lr_scheduler
-import time
 import os
-from sklearn.metrics import roc_auc_score, recall_score, f1_score
+import random
+import time
+
+import numpy as np
+import scipy.io as scio
+import torch
 from dotenv import load_dotenv
-load_dotenv()
-# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-device = torch.device(os.getenv("DEVICE","cpu"))
-print(device)
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, f1_score, recall_score, roc_auc_score
+from sklearn.model_selection import KFold, train_test_split
+
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -24,209 +18,187 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-setup_seed(123)
 
-N_subjects = 871
+def load_and_preprocess_data(atlas_path, label_path, hc_label=0):
+    data_atlas = scio.loadmat(atlas_path)
+    x = data_atlas["connectivity"]
+    y = np.loadtxt(label_path).astype(np.int64)
 
+    finite_mask = np.isfinite(x)
+    normal_subject_mask = y == hc_label
+    reference_x = x[normal_subject_mask] if np.any(normal_subject_mask) else x
+    reference_finite_mask = np.isfinite(reference_x)
+    mean_connectivity = np.nanmean(np.where(reference_finite_mask, reference_x, np.nan), axis=0)
+    mean_connectivity = np.nan_to_num(mean_connectivity, nan=0.0, posinf=0.0, neginf=0.0)
+    x = np.where(finite_mask, x, mean_connectivity[np.newaxis, :, :]).astype(np.float32)
 
-class SimpleTransformerModel(nn.Module):
-    def __init__(self, input_dim, model_dim, num_classes,feature_dim=2, num_heads=2, num_layers=1, dropout=0.25):
-        super(SimpleTransformerModel, self).__init__()
-
-        self.model_dim = model_dim
-        # 输入层，将原始特征转换为模型维度
-        self.input_fc = nn.Linear(input_dim, model_dim)
-        self.input_bn = nn.BatchNorm1d(model_dim)
-        # 定义Transformer编码器层
-        transformer_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=num_heads, dropout=dropout)
-        
-        # 使用多个Transformer编码器层创建Transformer编码器
-        self.transformer = nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
-        self.output_bn = nn.BatchNorm1d(model_dim)
-        # 输出层
-        # self.output_fc = nn.Linear(model_dim, num_classes)
-        self.output_fc = nn.Linear(model_dim, feature_dim)
-
-    def forward(self, x):
-        # 将输入数据通过输入全连接层转换
-        x = self.input_fc(x)  # [batch, seq_len, features]
-        # 应用输入批量归一化
-        x = x.permute(0, 2, 1) # 调整维度以匹配BatchNorm1d的输入要求
-        x = self.input_bn(x)
-        x = x.permute(0, 2, 1) # 恢复原始维度
-        # 调整维度以符合Transformer的输入要求
-        x = x.permute(1, 0, 2)  # [seq_len, batch, features]
-
-        # Transformer处理，每个输入元素（token）被转换
-        x = self.transformer(x)  # 在这一步，模型内部处理Q (Query), K (Key), V (Value)
-
-        # 对所有序列位置取平均，聚合序列信息
-        x = x.mean(dim=0)  # [batch, features]
-        x = self.output_bn(x)
-
-        # 通过输出全连接层获得最终的分类结果
-        x = self.output_fc(x)  # [batch, num_classes]
-
-        return x
+    return x, y
 
 
-'''
-    导入ABIDE数据
-'''
+def compute_fold_metrics(y_true, preds, probs):
+    acc = accuracy_score(y_true, preds)
+    recall = recall_score(y_true, preds, average="macro", zero_division=1)
+    f1 = f1_score(y_true, preds, average="macro", zero_division=1)
+    if np.unique(y_true).size > 1:
+        auc_score = roc_auc_score(y_true, probs)
+    else:
+        auc_score = 0.5
+    return acc, recall, f1, auc_score
 
-print('loading ABIDE data...')
-Data_atlas1 = scio.loadmat('./ABIDEdata/pcc_correlation_871_cc400_.mat')  # 更新为cc400数据路径
-X = Data_atlas1['connectivity']
-Y = np.loadtxt('./ABIDEdata/871_label_cc400.txt')  # 更新为cc400标签路径
 
-Nodes_Atlas1 = X.shape[-1]
+def select_rf_model(x_train, y_train, x_val, y_val):
+    candidates = [
+        {"n_estimators": 200, "max_depth": None, "min_samples_leaf": 1},
+        {"n_estimators": 300, "max_depth": None, "min_samples_leaf": 1},
+        {"n_estimators": 300, "max_depth": 20, "min_samples_leaf": 2},
+    ]
 
-where_are_nan = np.isnan(X)
-where_are_inf = np.isinf(X)
+    best_model = None
+    best_params = None
+    best_val_score = -np.inf
 
-where_are_nan = np.isnan(X)
-where_are_inf = np.isinf(X)
-for bb in range(0, N_subjects):
-    for i in range(0, Nodes_Atlas1):
-        for j in range(0, Nodes_Atlas1):
-            if where_are_nan[bb][i][j]:
-                X[bb][i][j] = 0
-            if where_are_inf[bb][i][j]:
-                X[bb][i][j] = 1
+    for params in candidates:
+        model = RandomForestClassifier(
+            random_state=42,
+            n_jobs=-1,
+            **params,
+        )
+        model.fit(x_train, y_train)
+        val_probs = model.predict_proba(x_val)[:, 1]
+        if np.unique(y_val).size > 1:
+            val_score = roc_auc_score(y_val, val_probs)
+        else:
+            val_preds = model.predict(x_val)
+            val_score = accuracy_score(y_val, val_preds)
 
-print('---------------------')
-print('X Atlas1:', X.shape)
-print('Y Atlas1:', Y.shape)
-print('---------------------')
+        if val_score > best_val_score:
+            best_val_score = val_score
+            best_model = model
+            best_params = params
 
-'''
-    超参数      
-'''
-result = []
-acc_k=[]
-f1_k=[]
-recall_k=[]
-auc_k=[]
-acc_final = 0
-result_final = []
-recall_list = []
-f1_list = []
-auc_list = []
-acc_final = 0
+    return best_model, best_params, best_val_score
 
-epochs = 30
-batch_size = 64
-dropout = 0.25
-lr = 0.005
-decay = 0.01
-num_heads=2
-num_layers=1
-feature_dim=2
-model_dim = 64
-input_dim = Nodes_Atlas1 * Nodes_Atlas1
-'''
-    模型训练
-'''
-from sklearn.model_selection import KFold
-time_train_list = []
-for ind in range(1):
-    setup_seed(ind)
 
-    nodes_number = Nodes_Atlas1
-    nums = np.ones(Nodes_Atlas1)
-    nums[:Nodes_Atlas1 - nodes_number] = 0
-    np.random.seed(1)
-    np.random.shuffle(nums)
-    Mask = nums.reshape(nums.shape[0], 1) * nums
-    Masked_X = X * Mask
-    J = nodes_number
-    for i in range(0, J):
-        ind = i
-        if nums[ind] == 0:
-            for j in range(J, Nodes_Atlas1):
-                if nums[j] == 1:
-                    Masked_X[:, [ind, j], :] = Masked_X[:, [j, ind], :]
-                    Masked_X[:, :, [ind, j]] = Masked_X[:, :, [j, ind]]
-                    J = j + 1
-                    break
+def main():
+    load_dotenv()
+    device = torch.device(os.getenv("DEVICE", "cpu"))
+    print(device)
 
-    Masked_X = Masked_X[:, :nodes_number, :nodes_number]
-    X = Masked_X
+    setup_seed(123)
 
-    acc_all = 0
-    kf = KFold(n_splits=10, shuffle=True)
-    kfold_index = 0
-    for trainval_index, test_index in kf.split(X, Y):
-        kfold_index += 1
-        time_train_start = time.time()
-        print('kfold_index:', kfold_index)
+    data_load_start = time.time()
+    print("loading ABIDE data...")
+    x, y = load_and_preprocess_data(
+        atlas_path="./ABIDEdata/pcc_correlation_871_cc400_.mat",
+        label_path="./ABIDEdata/871_label_cc400.txt",
+    )
+    data_load_end = time.time()
 
-        X_trainval, X_test = X[trainval_index], X[test_index]
-        Y_trainval, Y_test = Y[trainval_index], Y[test_index]
+    print("---------------------")
+    print("X Atlas1:", x.shape)
+    print("Y Atlas1:", y.shape)
+    print("---------------------")
 
-        for train_index, val_index in kf.split(X_trainval, Y_trainval):
-            # 取消验证集
-            X_train, X_val = X_trainval[:], X_trainval[:]
-            Y_train, Y_val = Y_trainval[:], Y_trainval[:]
+    outer_folds = 10
+    val_ratio = 0.1
 
-        print('X_train', X_train.shape)
-        print('X_test', X_test.shape)
-        print('Y_train', Y_train.shape)
-        print('Y_test', Y_test.shape)
+    result = []
+    recall_k = []
+    f1_k = []
+    auc_k = []
+    result_final = []
+    recall_list = []
+    f1_list = []
+    auc_list = []
+    acc_final = 0.0
+    time_train_list = []
 
-        X_train = X_train.reshape(X_train.shape[0], -1)
-        X_test = X_test.reshape(X_test.shape[0], -1)
+    for run_idx in range(1):
+        setup_seed(run_idx)
+        acc_all = 0.0
+        kf = KFold(n_splits=outer_folds, shuffle=True, random_state=42)
 
-        model = RandomForestClassifier(n_estimators=100, random_state=42)
-        model.fit(X_train, Y_train)
+        for kfold_index, (trainval_index, test_index) in enumerate(kf.split(x, y), start=1):
+            time_train_start = time.time()
+            print("kfold_index:", kfold_index)
 
-        preds = model.predict(X_test)
-        acc = metrics.accuracy_score(preds, Y_test)
-        probs = model.predict_proba(X_test)[:, 1]  # 假设第二列是正类的概率
-        auc_score = roc_auc_score(Y_test, probs)
-        recall = recall_score(Y_test, preds, average='macro', zero_division=1)
-        f1 = f1_score(Y_test, preds, average='macro', zero_division=1)
-        
-        print('Test acc', acc, 'Test recall', recall, 'Test f1', f1, 'Test auc', auc_score)
-        
-        recall_list.append(recall)
-        f1_list.append(f1)
-        auc_list.append(auc_score)
+            x_trainval, x_test = x[trainval_index], x[test_index]
+            y_trainval, y_test = y[trainval_index], y[test_index]
 
-        result.append([kfold_index, acc])
-        acc_all += acc
-        auc_k.append([kfold_index, auc_score])
-        recall_k.append([kfold_index, recall])
-        f1_k.append([kfold_index, f1])
-        time_train_end = time.time()
+            x_train, x_val, y_train, y_val = train_test_split(
+                x_trainval,
+                y_trainval,
+                test_size=val_ratio,
+                random_state=42 + kfold_index,
+                stratify=y_trainval,
+            )
 
-    temp = acc_all / 10
-    acc_final += temp
-    result_final.append(temp)
-    ACC = acc_final / 10
-    print(result)
-    time_train_list.append(time_train_end - time_train_start)
-print(result_final)
-print(acc_final)
-print(f"Ave Recall: {np.mean(recall_list)}")
-print(f"Ave F1: {np.mean(f1_list)}")
-print(f"Ave AUC: {np.mean(auc_list)}")
-print(f"Ave Training Time: {np.mean(time_train_list)} seconds")
-    
-# class SimpleTransformerModel(nn.Module):
-#     def __init__(self, input_dim, model_dim, num_classes, num_heads=2, num_layers=1, dropout=0.1):
-#         super(SimpleTransformerModel, self).__init__()
+            print("X_train", x_train.shape)
+            print("X_val", x_val.shape)
+            print("X_test", x_test.shape)
+            print("Y_train", y_train.shape)
+            print("Y_val", y_val.shape)
+            print("Y_test", y_test.shape)
 
-#         self.model_dim = model_dim
-#         self.input_fc = nn.Linear(input_dim, model_dim)
-#         transformer_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=num_heads, dropout=dropout)
-#         self.transformer = nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
-#         self.output_fc = nn.Linear(model_dim, num_classes)
+            x_train_flat = x_train.reshape(x_train.shape[0], -1)
+            x_val_flat = x_val.reshape(x_val.shape[0], -1)
+            x_test_flat = x_test.reshape(x_test.shape[0], -1)
 
-#     def forward(self, x):
-#         x = self.input_fc(x)
-#         x = x.permute(1, 0, 2)  # Transformer期望的输入形状是 [seq_len, batch, features]
-#         x = self.transformer(x)
-#         x = x.mean(dim=0)  # 对所有序列位置取平均
-#         x = self.output_fc(x)
-#         return x
+            model, best_params, best_val_score = select_rf_model(
+                x_train_flat,
+                y_train,
+                x_val_flat,
+                y_val,
+            )
+
+            test_preds = model.predict(x_test_flat)
+            test_probs = model.predict_proba(x_test_flat)[:, 1]
+            acc, recall, f1, auc_score = compute_fold_metrics(y_test, test_preds, test_probs)
+
+            print(
+                "Test acc",
+                acc,
+                "Test recall",
+                recall,
+                "Test f1",
+                f1,
+                "Test auc",
+                auc_score,
+                "best_val_score",
+                best_val_score,
+                "best_params",
+                best_params,
+            )
+
+            result.append([kfold_index, acc])
+            recall_k.append([kfold_index, recall])
+            f1_k.append([kfold_index, f1])
+            auc_k.append([kfold_index, auc_score])
+
+            recall_list.append(recall)
+            f1_list.append(f1)
+            auc_list.append(auc_score)
+
+            acc_all += acc
+            time_train_end = time.time()
+            time_train_list.append(time_train_end - time_train_start)
+
+        temp = acc_all / outer_folds
+        acc_final += temp
+        result_final.append(temp)
+
+    print("acc", result)
+    print("recall", recall_k)
+    print("f1", f1_k)
+    print("AUC", auc_k)
+    print(result_final)
+    print(acc_final)
+    print(f"Ave Recall: {np.mean(recall_list)}")
+    print(f"Ave F1: {np.mean(f1_list)}")
+    print(f"Ave AUC: {np.mean(auc_list)}")
+    print(f"Data Loading Time: {data_load_end - data_load_start} seconds")
+    print(f"Ave Training Time: {np.mean(time_train_list)} seconds")
+
+
+if __name__ == "__main__":
+    main()

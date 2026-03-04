@@ -1,23 +1,15 @@
-import torch.nn as nn
-import torch.nn.functional as F
-import torch
-import torch.optim as optim
-import numpy as np
-import random
-from sklearn import metrics
-import scipy.io as scio
-from torch.optim import lr_scheduler
-import time
-from sklearn.svm import SVC
-# import cuml
-# from cuml.svm import SVC
-from sklearn.metrics import roc_auc_score, recall_score, f1_score
 import os
+import random
+import time
+
+import numpy as np
+import scipy.io as scio
+import torch
 from dotenv import load_dotenv
-load_dotenv()
-# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-device = torch.device(os.getenv("DEVICE","cpu"))
-print(device)
+from sklearn.metrics import accuracy_score, f1_score, recall_score, roc_auc_score
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.svm import SVC
+
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -26,281 +18,183 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-setup_seed(123)
 
-N_subjects = 871
+def load_and_preprocess_data(atlas_path, label_path, hc_label=0):
+    data_atlas = scio.loadmat(atlas_path)
+    x = data_atlas["connectivity"]
+    y = np.loadtxt(label_path).astype(np.int64)
 
+    finite_mask = np.isfinite(x)
+    normal_subject_mask = y == hc_label
+    reference_x = x[normal_subject_mask] if np.any(normal_subject_mask) else x
+    reference_finite_mask = np.isfinite(reference_x)
+    mean_connectivity = np.nanmean(np.where(reference_finite_mask, reference_x, np.nan), axis=0)
+    mean_connectivity = np.nan_to_num(mean_connectivity, nan=0.0, posinf=0.0, neginf=0.0)
+    x = np.where(finite_mask, x, mean_connectivity[np.newaxis, :, :]).astype(np.float32)
 
-class SimpleTransformerModel(nn.Module):
-    def __init__(self, input_dim, model_dim, num_classes,feature_dim=2, num_heads=2, num_layers=1, dropout=0.25):
-        super(SimpleTransformerModel, self).__init__()
-
-        self.model_dim = model_dim
-        # 输入层，将原始特征转换为模型维度
-        self.input_fc = nn.Linear(input_dim, model_dim)
-        self.input_bn = nn.BatchNorm1d(model_dim)
-        # 定义Transformer编码器层
-        transformer_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=num_heads, dropout=dropout)
-        
-        # 使用多个Transformer编码器层创建Transformer编码器
-        self.transformer = nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
-        self.output_bn = nn.BatchNorm1d(model_dim)
-        # 输出层
-        # self.output_fc = nn.Linear(model_dim, num_classes)
-        self.output_fc = nn.Linear(model_dim, feature_dim)
-
-    def forward(self, x):
-        # 将输入数据通过输入全连接层转换
-        x = self.input_fc(x)  # [batch, seq_len, features]
-        # 应用输入批量归一化
-        x = x.permute(0, 2, 1) # 调整维度以匹配BatchNorm1d的输入要求
-        x = self.input_bn(x)
-        x = x.permute(0, 2, 1) # 恢复原始维度
-        # 调整维度以符合Transformer的输入要求
-        x = x.permute(1, 0, 2)  # [seq_len, batch, features]
-
-        # Transformer处理，每个输入元素（token）被转换
-        x = self.transformer(x)  # 在这一步，模型内部处理Q (Query), K (Key), V (Value)
-
-        # 对所有序列位置取平均，聚合序列信息
-        x = x.mean(dim=0)  # [batch, features]
-        x = self.output_bn(x)
-
-        # 通过输出全连接层获得最终的分类结果
-        x = self.output_fc(x)  # [batch, num_classes]
-
-        return x
+    return x, y
 
 
-'''
-    导入ABIDE数据
-'''
+def compute_fold_metrics(y_true, preds, probs):
+    acc = accuracy_score(y_true, preds)
+    recall = recall_score(y_true, preds, average="macro", zero_division=1)
+    f1 = f1_score(y_true, preds, average="macro", zero_division=1)
+    if np.unique(y_true).size > 1:
+        auc_score = roc_auc_score(y_true, probs)
+    else:
+        auc_score = 0.5
+    return acc, recall, f1, auc_score
 
-print('loading ABIDE data...')
-Data_atlas1 = scio.loadmat('./ABIDEdata/pcc_correlation_871_cc400_.mat')  # 更新为cc400数据路径
-X = Data_atlas1['connectivity']
-Y = np.loadtxt('./ABIDEdata/871_label_cc400.txt')  # 更新为cc400标签路径
 
-Nodes_Atlas1 = X.shape[-1]
+def select_svm_model(x_train, y_train, x_val, y_val):
+    candidates = [
+        {"C": 0.5, "gamma": "scale"},
+        {"C": 1.0, "gamma": "scale"},
+        {"C": 2.0, "gamma": "scale"},
+    ]
 
-where_are_nan = np.isnan(X)
-where_are_inf = np.isinf(X)
+    best_model = None
+    best_params = None
+    best_val_score = -np.inf
 
-where_are_nan = np.isnan(X)
-where_are_inf = np.isinf(X)
-for bb in range(0, N_subjects):
-    for i in range(0, Nodes_Atlas1):
-        for j in range(0, Nodes_Atlas1):
-            if where_are_nan[bb][i][j]:
-                X[bb][i][j] = 0
-            if where_are_inf[bb][i][j]:
-                X[bb][i][j] = 1
-
-print('---------------------')
-print('X Atlas1:', X.shape)
-print('Y Atlas1:', Y.shape)
-print('---------------------')
-
-'''
-    超参数      
-'''
-result = []
-acc_k=[]
-f1_k=[]
-recall_k=[]
-auc_k=[]
-acc_final = 0
-result_final = []
-recall_list = []
-f1_list = []
-auc_list = []
-acc_final = 0
-
-epochs = 30
-batch_size = 64
-dropout = 0.25
-lr = 0.005
-decay = 0.01
-num_heads=2
-num_layers=1
-feature_dim=2
-model_dim = 64
-input_dim = Nodes_Atlas1 * Nodes_Atlas1
-'''
-    模型训练
-'''
-from sklearn.model_selection import KFold
-time_train_list = []
-for ind in range(1):
-    setup_seed(ind)
-
-    nodes_number = Nodes_Atlas1
-    nums = np.ones(Nodes_Atlas1)
-    nums[:Nodes_Atlas1 - nodes_number] = 0
-    np.random.seed(1)
-    np.random.shuffle(nums)
-    Mask = nums.reshape(nums.shape[0], 1) * nums
-    Masked_X = X * Mask
-    J = nodes_number
-    for i in range(0, J):
-        ind = i
-        if nums[ind] == 0:
-            for j in range(J, Nodes_Atlas1):
-                if nums[j] == 1:
-                    Masked_X[:, [ind, j], :] = Masked_X[:, [j, ind], :]
-                    Masked_X[:, :, [ind, j]] = Masked_X[:, :, [j, ind]]
-                    J = j + 1
-                    break
-
-    Masked_X = Masked_X[:, :nodes_number, :nodes_number]
-    X = Masked_X
-
-    acc_all = 0
-    kf = KFold(n_splits=10, shuffle=True)
-    kfold_index = 0
-    for trainval_index, test_index in kf.split(X, Y):
-        kfold_index += 1
-        time_train_start = time.time()
-        print('kfold_index:', kfold_index)
-
-        X_trainval, X_test = X[trainval_index], X[test_index]
-        Y_trainval, Y_test = Y[trainval_index], Y[test_index]
-
-        for train_index, val_index in kf.split(X_trainval, Y_trainval):
-            X_train, X_val = X_trainval[:], X_trainval[:]
-            Y_train, Y_val = Y_trainval[:], Y_trainval[:]
-
-        print('X_train', X_train.shape)
-        print('X_test', X_test.shape)
-        print('Y_train', Y_train.shape)
-        print('Y_test', Y_test.shape)
-
-        X_train = X_train.reshape(X_train.shape[0], -1)
-        X_test = X_test.reshape(X_test.shape[0], -1)
-
-        model = SVC(kernel='rbf', probability=True)
-        model.fit(X_train, Y_train)
-
-        preds = model.predict(X_test)
-        acc = metrics.accuracy_score(preds, Y_test)
-        probs = model.predict_proba(X_test)[:, 1]
-        probs_list = probs
-
-        if len(np.unique(Y_test)) > 1:
-            auc_score = roc_auc_score(Y_test, probs_list)
-            auc_list.append(auc_score)
+    for params in candidates:
+        model = SVC(kernel="rbf", probability=True, random_state=42, **params)
+        model.fit(x_train, y_train)
+        val_probs = model.predict_proba(x_val)[:, 1]
+        if np.unique(y_val).size > 1:
+            val_score = roc_auc_score(y_val, val_probs)
         else:
-            auc_list.append(0.5)
+            val_preds = model.predict(x_val)
+            val_score = accuracy_score(y_val, val_preds)
 
-        recall = recall_score(preds, Y_test, average='macro', zero_division=1)
-        f1 = f1_score(preds, Y_test, average='macro', zero_division=1)
-        print('Test acc', acc, 'Test recall', recall, 'Test f1', f1, 'Test auc', auc_score)
-        recall_list.append(recall)
-        f1_list.append(f1)
+        if val_score > best_val_score:
+            best_val_score = val_score
+            best_model = model
+            best_params = params
 
-        result.append([kfold_index, acc])
-        acc_all += acc
-        auc_k.append([kfold_index, auc_score])
-        recall_k.append([kfold_index, recall])
-        f1_k.append([kfold_index, f1])
-        time_train_end = time.time()
-
-    temp = acc_all / 10
-    acc_final += temp
-    result_final.append(temp)
-    ACC = acc_final / 10
-    print(result)
-    time_train_list.append(time_train_end - time_train_start)
-print(result_final)
-print(acc_final)
-print(f"Ave Recall: {np.mean(recall_list)}")
-print(f"Ave F1: {np.mean(f1_list)}")
-print(f"Ave AUC: {np.mean(auc_list)}")
-print(f"Ave Training Time: {np.mean(time_train_list)} seconds")
+    return best_model, best_params, best_val_score
 
 
-class E2E(nn.Module):
+def main():
+    load_dotenv()
+    device = torch.device(os.getenv("DEVICE", "cpu"))
+    print(device)
 
-    def __init__(self, in_channel, out_channel, input_shape):
-        super().__init__()
-        self.in_channel = in_channel
-        self.out_channel = out_channel
+    setup_seed(123)
 
-        self.d = input_shape[0]
-        self.conv1xd = nn.Conv2d(in_channel,out_channel,(self.d,1))
-        self.convdx1 = nn.Conv2d(in_channel,out_channel,(1,self.d))
-        self.node = 200
+    data_load_start = time.time()
+    print("loading ABIDE data...")
+    x, y = load_and_preprocess_data(
+        atlas_path="./ABIDEdata/pcc_correlation_871_cc400_.mat",
+        label_path="./ABIDEdata/871_label_cc400.txt",
+    )
+    data_load_end = time.time()
 
-    def forward(self, A):
-        A = A.view(-1, self.in_channel,self.node,self.node)
-        a = self.conv1xd(A)
-        b = self.convdx1(A)
+    print("---------------------")
+    print("X Atlas1:", x.shape)
+    print("Y Atlas1:", y.shape)
+    print("---------------------")
 
-        concat1 = torch.cat([a]*self.d,2) #d个a []括号内 竖着拼 d*d
-        concat2 = torch.cat([b]*self.d,3) #横着拼 d*d
+    outer_folds = 10
+    val_ratio = 0.1
 
-        return concat1+concat2
+    result = []
+    recall_k = []
+    f1_k = []
+    auc_k = []
+    result_final = []
+    recall_list = []
+    f1_list = []
+    auc_list = []
+    acc_final = 0.0
+    time_train_list = []
 
-class Model(nn.Module):
-    def __init__(self, dropout=0.5, num_class=1, nodes=200):
-        super().__init__()
+    for run_idx in range(1):
+        setup_seed(run_idx)
+        acc_all = 0.0
+        kf = KFold(n_splits=outer_folds, shuffle=True, random_state=42)
 
-        self.e2e = nn.Sequential(
-            E2E(1, 8, (nodes, nodes)), #1 32   32 56    56 32    32 2
-            nn.LeakyReLU(0.33),
-            E2E(8, 8, (nodes, nodes)),
-            nn.LeakyReLU(0.33),
-        )
+        for kfold_index, (trainval_index, test_index) in enumerate(kf.split(x, y), start=1):
+            time_train_start = time.time()
+            print("kfold_index:", kfold_index)
 
-        self.e2n = nn.Sequential(
-            nn.Conv2d(8, 48,(1, nodes)), # 56 0.602
-            nn.LeakyReLU(0.33)
-        )
+            x_trainval, x_test = x[trainval_index], x[test_index]
+            y_trainval, y_test = y[trainval_index], y[test_index]
 
-        self.n2g = nn.Sequential(
-            nn.Conv2d(48, nodes,(nodes, 1)),
-            nn.LeakyReLU(0.33)
-        )
+            x_train, x_val, y_train, y_val = train_test_split(
+                x_trainval,
+                y_trainval,
+                test_size=val_ratio,
+                random_state=42 + kfold_index,
+                stratify=y_trainval,
+            )
 
-        self.linear = nn.Sequential(
-            nn.Linear(nodes, 64),
-            nn.Dropout(dropout),
-            nn.LeakyReLU(0.33),
-            nn.Linear(64, 10),
-            nn.Dropout(dropout),
-            nn.LeakyReLU(0.33),
-            nn.Linear(10, num_class)
-        )
+            print("X_train", x_train.shape)
+            print("X_val", x_val.shape)
+            print("X_test", x_test.shape)
+            print("Y_train", y_train.shape)
+            print("Y_val", y_val.shape)
+            print("Y_test", y_test.shape)
 
-        for layer in self.linear:
-            if isinstance(layer,nn.Linear):
-                nn.init.kaiming_normal_(layer.weight)
-                nn.init.zeros_(layer.bias)
+            x_train_flat = x_train.reshape(x_train.shape[0], -1)
+            x_val_flat = x_val.reshape(x_val.shape[0], -1)
+            x_test_flat = x_test.reshape(x_test.shape[0], -1)
 
-    def forward(self, x):
-        x = self.e2e(x)
-        x = self.e2n(x)
-        x = self.n2g(x)
-        x = x.view(x.size(0), -1)
-        x = self.linear(x)
-        x = F.softmax(x, dim=-1)
+            model, best_params, best_val_score = select_svm_model(
+                x_train_flat,
+                y_train,
+                x_val_flat,
+                y_val,
+            )
 
-        return x, None
-    
-# class SimpleTransformerModel(nn.Module):
-#     def __init__(self, input_dim, model_dim, num_classes, num_heads=2, num_layers=1, dropout=0.1):
-#         super(SimpleTransformerModel, self).__init__()
+            test_preds = model.predict(x_test_flat)
+            test_probs = model.predict_proba(x_test_flat)[:, 1]
+            acc, recall, f1, auc_score = compute_fold_metrics(y_test, test_preds, test_probs)
 
-#         self.model_dim = model_dim
-#         self.input_fc = nn.Linear(input_dim, model_dim)
-#         transformer_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=num_heads, dropout=dropout)
-#         self.transformer = nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
-#         self.output_fc = nn.Linear(model_dim, num_classes)
+            print(
+                "Test acc",
+                acc,
+                "Test recall",
+                recall,
+                "Test f1",
+                f1,
+                "Test auc",
+                auc_score,
+                "best_val_score",
+                best_val_score,
+                "best_params",
+                best_params,
+            )
 
-#     def forward(self, x):
-#         x = self.input_fc(x)
-#         x = x.permute(1, 0, 2)  # Transformer期望的输入形状是 [seq_len, batch, features]
-#         x = self.transformer(x)
-#         x = x.mean(dim=0)  # 对所有序列位置取平均
-#         x = self.output_fc(x)
-#         return x
+            result.append([kfold_index, acc])
+            recall_k.append([kfold_index, recall])
+            f1_k.append([kfold_index, f1])
+            auc_k.append([kfold_index, auc_score])
+
+            recall_list.append(recall)
+            f1_list.append(f1)
+            auc_list.append(auc_score)
+
+            acc_all += acc
+            time_train_end = time.time()
+            time_train_list.append(time_train_end - time_train_start)
+
+        temp = acc_all / outer_folds
+        acc_final += temp
+        result_final.append(temp)
+
+    print("acc", result)
+    print("recall", recall_k)
+    print("f1", f1_k)
+    print("AUC", auc_k)
+    print(result_final)
+    print(acc_final)
+    print(f"Ave Recall: {np.mean(recall_list)}")
+    print(f"Ave F1: {np.mean(f1_list)}")
+    print(f"Ave AUC: {np.mean(auc_list)}")
+    print(f"Data Loading Time: {data_load_end - data_load_start} seconds")
+    print(f"Ave Training Time: {np.mean(time_train_list)} seconds")
+
+
+if __name__ == "__main__":
+    main()

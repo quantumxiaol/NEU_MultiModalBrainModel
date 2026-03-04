@@ -210,6 +210,7 @@ def run_transformer_experiment(
     print(device)
     setup_seed(123)
 
+    data_load_start = time.time()
     print("loading ABIDE data...")
     data_atlas = scio.loadmat(atlas_path)
     X = data_atlas["connectivity"]
@@ -224,6 +225,7 @@ def run_transformer_experiment(
     mean_connectivity = np.nanmean(np.where(reference_finite_mask, reference_X, np.nan), axis=0)
     mean_connectivity = np.nan_to_num(mean_connectivity, nan=0.0, posinf=0.0, neginf=0.0)
     X = np.where(finite_mask, X, mean_connectivity[np.newaxis, :, :])
+    data_load_end = time.time()
 
     print("---------------------")
     print("X Atlas:", X.shape)
@@ -236,8 +238,14 @@ def run_transformer_experiment(
     os.makedirs(attention_output_root, exist_ok=True)
 
     result = []
+    recall_k = []
+    f1_k = []
+    auc_k = []
     acc_final = 0
     result_final = []
+    recall_list = []
+    f1_list = []
+    auc_list = []
     time_train_list = []
     input_dim = nodes
     node_labels = [f"Node_{i:03d}" for i in range(nodes)]
@@ -380,11 +388,26 @@ def run_transformer_experiment(
                     test_data_batch_dev, return_attention=True, use_rollout=True
                 )
                 test_preds = torch.argmax(outputs, dim=1).cpu().numpy()
+                test_probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
                 acc = metrics.accuracy_score(Y_test, test_preds)
-                print("Test acc", acc)
+                recall = metrics.recall_score(Y_test, test_preds, average="macro", zero_division=1)
+                f1 = metrics.f1_score(Y_test, test_preds, average="macro", zero_division=1)
+                if np.unique(Y_test).size > 1:
+                    auc_score = metrics.roc_auc_score(Y_test, test_probs)
+                else:
+                    auc_score = 0.5
+                print("Test acc", acc, "Test recall", recall, "Test f1", f1, "Test auc", auc_score)
 
             torch.save(model.state_dict(), os.path.join(model_save_dir, f"{kfold_index}.pt"))
             result.append([kfold_index, acc])
+            recall_k.append([kfold_index, recall])
+            f1_k.append([kfold_index, f1])
+            auc_k.append([kfold_index, auc_score])
+
+            recall_list.append(recall)
+            f1_list.append(f1)
+            auc_list.append(auc_score)
+
             acc_all += acc
             time_train_end = time.time()
             time_train_list.append(time_train_end - time_train_start)
@@ -415,8 +438,10 @@ def run_transformer_experiment(
         temp = acc_all / outer_folds
         acc_final += temp
         result_final.append(temp)
-        ACC = acc_final / len(result_final)
-        print(result)
+        print("acc", result)
+        print("recall", recall_k)
+        print("f1", f1_k)
+        print("AUC", auc_k)
 
         global_attention_dir = os.path.join(attention_output_root, "global")
         os.makedirs(global_attention_dir, exist_ok=True)
@@ -502,4 +527,8 @@ def run_transformer_experiment(
 
     print(result_final)
     print(acc_final)
+    print(f"Ave Recall: {np.mean(recall_list)}")
+    print(f"Ave F1: {np.mean(f1_list)}")
+    print(f"Ave AUC: {np.mean(auc_list)}")
+    print(f"Data Loading Time: {data_load_end - data_load_start} seconds")
     print(f"Ave Training Time: {np.mean(time_train_list)} seconds")

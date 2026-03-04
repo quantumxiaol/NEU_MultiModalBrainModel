@@ -1,20 +1,19 @@
+import copy
+import os
+import random
+import time
+
+import numpy as np
+import scipy.io as scio
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch
 import torch.optim as optim
-import numpy as np
-import random
-from sklearn import metrics
-import scipy.io as scio
-from torch.optim import lr_scheduler
-import time
-import os
-from sklearn.metrics import accuracy_score, recall_score, f1_score,roc_auc_score
 from dotenv import load_dotenv
-load_dotenv()
-# device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-device = torch.device(os.getenv("DEVICE","cpu"))
-print(device)
+from sklearn.metrics import accuracy_score, f1_score, recall_score, roc_auc_score
+from sklearn.model_selection import KFold, train_test_split
+from torch.optim import lr_scheduler
+
 
 def setup_seed(seed):
     torch.manual_seed(seed)
@@ -23,404 +22,252 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
-setup_seed(123)
 
-N_subjects = 871
+def load_and_preprocess_data(atlas_path, label_path, hc_label=0):
+    data_atlas = scio.loadmat(atlas_path)
+    x = data_atlas["connectivity"]
+    y = np.loadtxt(label_path).astype(np.int64)
 
-# https://github.com/Wayfear/BrainNetworkTransformer/blob/main/source/models/brainnetcnn.py
+    finite_mask = np.isfinite(x)
+    normal_subject_mask = y == hc_label
+    reference_x = x[normal_subject_mask] if np.any(normal_subject_mask) else x
+    reference_finite_mask = np.isfinite(reference_x)
+    mean_connectivity = np.nanmean(np.where(reference_finite_mask, reference_x, np.nan), axis=0)
+    mean_connectivity = np.nan_to_num(mean_connectivity, nan=0.0, posinf=0.0, neginf=0.0)
+    x = np.where(finite_mask, x, mean_connectivity[np.newaxis, :, :]).astype(np.float32)
 
-class E2EBlock(torch.nn.Module):
-    '''E2Eblock.'''
+    return x, y
 
-    def __init__(self, in_planes, planes, roi_num, bias=True):
+
+def compute_fold_metrics(y_true, preds, probs):
+    acc = accuracy_score(y_true, preds)
+    recall = recall_score(y_true, preds, average="macro", zero_division=1)
+    f1 = f1_score(y_true, preds, average="macro", zero_division=1)
+    if np.unique(y_true).size > 1:
+        auc_score = roc_auc_score(y_true, probs)
+    else:
+        auc_score = 0.5
+    return acc, recall, f1, auc_score
+
+
+class E2EBlock(nn.Module):
+    def __init__(self, in_planes, out_planes, roi_num, bias=True):
         super().__init__()
         self.d = roi_num
-        self.cnn1 = torch.nn.Conv2d(in_planes, planes, (1, self.d), bias=bias)
-        self.cnn2 = torch.nn.Conv2d(in_planes, planes, (self.d, 1), bias=bias)
+        self.cnn1 = nn.Conv2d(in_planes, out_planes, (1, self.d), bias=bias)
+        self.cnn2 = nn.Conv2d(in_planes, out_planes, (self.d, 1), bias=bias)
 
     def forward(self, x):
         a = self.cnn1(x)
         b = self.cnn2(x)
-        return torch.cat([a]*self.d, 3)+torch.cat([b]*self.d, 2)
+        return torch.cat([a] * self.d, dim=3) + torch.cat([b] * self.d, dim=2)
 
 
-class BrainNetCNN(torch.nn.Module):
-    def __init__(self, node_sz):
-        super().__init__() 
-        self.in_planes = 1
-        self.d = node_sz
+class BrainNetCNN(nn.Module):
+    def __init__(self, node_sz, dropout=0.25):
+        super().__init__()
+        self.e2econv1 = E2EBlock(1, 8, node_sz, bias=True)
+        self.e2econv2 = E2EBlock(8, 16, node_sz, bias=True)
+        self.e2n = nn.Conv2d(16, 32, (1, node_sz))
+        self.n2g = nn.Conv2d(32, 64, (node_sz, 1))
 
-        self.e2econv1 = E2EBlock(1, 8, self.d, bias=True)
-        self.e2econv2 = E2EBlock(8, 16, self.d, bias=True)
-        self.E2N = torch.nn.Conv2d(16, 1, (1, self.d))
-        self.N2G = torch.nn.Conv2d(1, 64, (self.d, 1))
-        self.dense1 = torch.nn.Linear(64, 32)
-        self.dense2 = torch.nn.Linear(32, 30)
-        self.dense3 = torch.nn.Linear(30, 2)
+        self.drop = nn.Dropout(dropout)
+        self.dense1 = nn.Linear(64, 32)
+        self.dense2 = nn.Linear(32, 16)
+        self.dense3 = nn.Linear(16, 2)
 
     def forward(self, x):
-        # x = x.unsqueeze(dim=1)  # 增加通道维度
+        # x: [batch, num_nodes, num_nodes]
+        if x.dim() == 3:
+            x = x.unsqueeze(1)
+
         out = F.leaky_relu(self.e2econv1(x), negative_slope=0.33)
         out = F.leaky_relu(self.e2econv2(out), negative_slope=0.33)
-        out = F.leaky_relu(self.E2N(out), negative_slope=0.33)
-        out = F.dropout(F.leaky_relu(self.N2G(out), negative_slope=0.33), p=0.5)
+        out = F.leaky_relu(self.e2n(out), negative_slope=0.33)
+        out = self.drop(F.leaky_relu(self.n2g(out), negative_slope=0.33))
+
         out = out.view(out.size(0), -1)
-        out = F.dropout(F.leaky_relu(self.dense1(out), negative_slope=0.33), p=0.5)
-        out = F.dropout(F.leaky_relu(self.dense2(out), negative_slope=0.33), p=0.5)
-        out = F.leaky_relu(self.dense3(out), negative_slope=0.33)
+        out = self.drop(F.leaky_relu(self.dense1(out), negative_slope=0.33))
+        out = self.drop(F.leaky_relu(self.dense2(out), negative_slope=0.33))
+        out = self.dense3(out)
         return out
 
 
-'''
-    导入ABIDE数据
-'''
+def main():
+    load_dotenv()
+    device = torch.device(os.getenv("DEVICE", "cpu"))
+    print(device)
 
-print('loading ABIDE data...')
-Data_atlas1 = scio.loadmat('./ABIDEdata/pcc_correlation_871_cc400_.mat')  # 更新为cc400数据路径
-X = Data_atlas1['connectivity']
-Y = np.loadtxt('./ABIDEdata/871_label_cc400.txt')  # 更新为cc400标签路径
+    setup_seed(123)
 
-Nodes_Atlas1 = X.shape[-1]
+    data_load_start = time.time()
+    print("loading ABIDE data...")
+    x, y = load_and_preprocess_data(
+        atlas_path="./ABIDEdata/pcc_correlation_871_cc400_.mat",
+        label_path="./ABIDEdata/871_label_cc400.txt",
+    )
+    data_load_end = time.time()
 
-where_are_nan = np.isnan(X)
-where_are_inf = np.isinf(X)
+    print("---------------------")
+    print("X Atlas1:", x.shape)
+    print("Y Atlas1:", y.shape)
+    print("---------------------")
 
-where_are_nan = np.isnan(X)
-where_are_inf = np.isinf(X)
-for bb in range(0, N_subjects):
-    for i in range(0, Nodes_Atlas1):
-        for j in range(0, Nodes_Atlas1):
-            if where_are_nan[bb][i][j]:
-                X[bb][i][j] = 0
-            if where_are_inf[bb][i][j]:
-                X[bb][i][j] = 1
+    epochs = 30
+    batch_size = 64
+    dropout = 0.25
+    lr = 1e-4
+    decay = 0.01
+    outer_folds = 10
+    val_ratio = 0.1
+    early_stop_patience = 10
+    early_stop_min_delta = 1e-4
 
-print('---------------------')
-print('X Atlas1:', X.shape)
-print('Y Atlas1:', Y.shape)
-print('---------------------')
+    os.makedirs("./modelsBrainNetcc400", exist_ok=True)
 
-'''
-    超参数      
-'''
-result = []
-acc_k=[]
-f1_k=[]
-recall_k=[]
-auc_k=[]
-acc_final = 0
-result_final = []
-recall_list = []
-f1_list = []
-auc_list = []
+    result = []
+    recall_k = []
+    f1_k = []
+    auc_k = []
+    result_final = []
+    recall_list = []
+    f1_list = []
+    auc_list = []
+    acc_final = 0.0
+    time_train_list = []
 
+    for run_idx in range(1):
+        setup_seed(run_idx)
+        acc_all = 0.0
+        kf = KFold(n_splits=outer_folds, shuffle=True, random_state=42)
 
-epochs = 30
-batch_size = 2
-dropout = 0.25
-lr = 0.005
-decay = 0.001
-acc_final = 0
-model_dim = 64
-input_dim = Nodes_Atlas1 * Nodes_Atlas1
-node_sz = Nodes_Atlas1
+        for kfold_index, (trainval_index, test_index) in enumerate(kf.split(x, y), start=1):
+            time_train_start = time.time()
+            print("kfold_index:", kfold_index)
 
-'''
-    模型训练
-'''
-from sklearn.model_selection import KFold
-time_train_list = []
-for ind in range(1):
-    setup_seed(ind)
+            x_trainval, x_test = x[trainval_index], x[test_index]
+            y_trainval, y_test = y[trainval_index], y[test_index]
 
-    nodes_number = Nodes_Atlas1
-    nums = np.ones(Nodes_Atlas1)
-    nums[:Nodes_Atlas1 - nodes_number] = 0
-    np.random.seed(1)
-    np.random.shuffle(nums)
-    Mask = nums.reshape(nums.shape[0], 1) * nums
-    Masked_X = X * Mask
-    J = nodes_number
-    for i in range(0, J):
-        ind = i
-        if nums[ind] == 0:
-            for j in range(J, Nodes_Atlas1):
-                if nums[j] == 1:
-                    Masked_X[:, [ind, j], :] = Masked_X[:, [j, ind], :]
-                    Masked_X[:, :, [ind, j]] = Masked_X[:, :, [j, ind]]
-                    J = j + 1
-                    break
+            x_train, x_val, y_train, y_val = train_test_split(
+                x_trainval,
+                y_trainval,
+                test_size=val_ratio,
+                random_state=42 + kfold_index,
+                stratify=y_trainval,
+            )
 
-    Masked_X = Masked_X[:, :nodes_number, :nodes_number]
-    X = Masked_X
+            print("X_train", x_train.shape)
+            print("X_val", x_val.shape)
+            print("X_test", x_test.shape)
+            print("Y_train", y_train.shape)
+            print("Y_val", y_val.shape)
+            print("Y_test", y_test.shape)
 
-    acc_all = 0
-    kf = KFold(n_splits=10, shuffle=True)
-    kfold_index = 0
-    for trainval_index, test_index in kf.split(X, Y):
-        kfold_index += 1
-        time_train_start = time.time()
-        print('kfold_index:', kfold_index)
+            model = BrainNetCNN(node_sz=x.shape[-1], dropout=dropout).to(device)
 
-        X_trainval, X_test = X[trainval_index], X[test_index]
-        Y_trainval, Y_test = Y[trainval_index], Y[test_index]
+            optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=decay)
+            scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+            loss_fn = nn.CrossEntropyLoss()
 
-        for train_index, val_index in kf.split(X_trainval, Y_trainval):
-            # 取消验证集
-            X_train, X_val = X_trainval[:], X_trainval[:]
-            Y_train, Y_val = Y_trainval[:], Y_trainval[:]
+            best_val_loss = float("inf")
+            best_state_dict = copy.deepcopy(model.state_dict())
+            epochs_no_improve = 0
 
-        X_train_reshaped = X_train.reshape(-1, 1, node_sz, node_sz)
-        X_test_reshaped = X_test.reshape(-1, 1, node_sz, node_sz)
+            for epoch in range(1, epochs + 1):
+                model.train()
+                idx_batch = np.random.permutation(x_train.shape[0])
+                loss_train_list = []
 
-        print('X_train', X_train.shape)
-        print('X_test', X_test.shape)
-        print('X_train_reshaped', X_train_reshaped.shape)
-        print('X_test_reshaped', X_test_reshaped.shape)
-        print('Y_train', Y_train.shape)
-        print('Y_test', Y_test.shape)
+                for start in range(0, x_train.shape[0], batch_size):
+                    batch = idx_batch[start : start + batch_size]
+                    train_data_batch = torch.from_numpy(x_train[batch]).float().to(device)
+                    train_label_batch = torch.from_numpy(y_train[batch]).long().to(device)
 
-        # model = SimpleTransformerModel(input_dim, model_dim, num_classes=2)
-        model = BrainNetCNN(node_sz=node_sz)
-        model.to(device)
-        # optimizer = optim.SGD(model.parameters(), lr=lr, weight_decay=decay, momentum=0.9, nesterov=True)
-        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=decay)
-        scheduler = lr_scheduler.StepLR(optimizer, step_size=40, gamma=0.2)  # 每30个epochs将学习率乘以0.1
-        # scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=0.0001)
+                    optimizer.zero_grad()
+                    outputs = model(train_data_batch)
+                    loss = loss_fn(outputs, train_label_batch)
+                    loss_train_list.append(loss.item())
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
 
-        loss_fn = nn.CrossEntropyLoss()
+                loss_train = float(np.mean(loss_train_list)) if loss_train_list else 0.0
 
-        for epoch in range(1, epochs + 1):
-            model.train()
-
-            idx_batch = np.random.permutation(int(X_train.shape[0]))
-            num_batch = X_train.shape[0] // int(batch_size)
-
-            loss_train = 0
-            for bn in range(num_batch):
-                if bn == num_batch - 1:
-                    batch = idx_batch[bn * int(batch_size):]
-                else:
-                    batch = idx_batch[bn * int(batch_size): (bn + 1) * int(batch_size)]
-                # train_data_batch = X_train[batch]
-                # train_label_batch = Y_train[batch]
-                # train_data_batch = train_data_batch.reshape(train_data_batch.shape[0], -1)
-                # train_data_batch_dev = torch.from_numpy(train_data_batch).float().to(device)
-                # train_data_batch_dev = train_data_batch_dev.unsqueeze(1)  # 增加序列维度
-                # train_label_batch_dev = torch.from_numpy(train_label_batch).long().to(device)
-
-                train_data_batch = X_train_reshaped[batch]
-                train_label_batch = Y_train[batch]
-        
-                # 无需重新塑形为向量再变回2D
-                train_data_batch_dev = torch.from_numpy(train_data_batch).float().to(device)
-                train_label_batch_dev = torch.from_numpy(train_label_batch).long().to(device)
-                # print(train_data_batch_dev.shape)
-                # print(train_label_batch_dev.shape)
-
-
-                optimizer.zero_grad()
-                # outputs, rec = model(train_data_batch_dev)
-                outputs = model(train_data_batch_dev)
-                loss1 = loss_fn(outputs, train_label_batch_dev)
-                loss = loss1
-                loss_train += loss
-                loss.backward()
-                optimizer.step()
-
-            loss_train /= num_batch
-            if epoch % 1 == 0:
-                print('epoch:', epoch, 'train loss:', loss_train.item())
-            scheduler.step()
-            # val
-            if epoch % 5 == 0:
                 model.eval()
-                # test_data_batch = X_test.reshape(X_test.shape[0], -1)  # 重塑为 (num_test_samples, 40000)
-                # test_data_batch_dev = torch.from_numpy(test_data_batch).float().to(device)
-                # test_data_batch_dev = test_data_batch_dev.unsqueeze(1)  # 添加伪序列维度 (num_test_samples, 1, 40000)
-                # test_data_batch_dev = torch.from_numpy(X_test).float().to(device)
-                # outputs, _= model(test_data_batch_dev)
-                test_data_batch_dev = torch.from_numpy(X_test_reshaped).float().to(device)
+                with torch.no_grad():
+                    val_data_batch = torch.from_numpy(x_val).float().to(device)
+                    val_label_batch = torch.from_numpy(y_val).long().to(device)
+                    val_outputs = model(val_data_batch)
+                    val_loss = loss_fn(val_outputs, val_label_batch).item()
+                    val_preds = torch.argmax(val_outputs, dim=1).cpu().numpy()
+                    val_acc = accuracy_score(y_val, val_preds)
 
+                if epoch % 5 == 0 or epoch == 1:
+                    print(
+                        "epoch:",
+                        epoch,
+                        "train loss:",
+                        loss_train,
+                        "val loss:",
+                        val_loss,
+                        "val acc:",
+                        val_acc,
+                    )
 
-
-                outputs = model(test_data_batch_dev)
-                _, indices = torch.max(outputs, dim=1)
-                preds = indices.cpu()
-                acc = metrics.accuracy_score(preds, Y_test)
-                # recall = recall_score(preds, Y_test, average='macro')  # 可以根据需要选择average参数
-                # f1 = f1_score(preds, Y_test, average='macro')  # 可以根据需要选择average参数
-                probs = torch.softmax(outputs, dim=1)[:, 1]  # 假设第二列是正类的概率
-                probs_list = probs.detach().cpu().numpy()
-                # y_true_list = Y1_test.cpu().numpy()
-
-                # 检查y_true中是否有多于一个类别
-                if len(np.unique(Y_test)) > 1:
-                    auc_score = roc_auc_score(Y_test, probs_list)
-                    auc_list.append(auc_score)
+                if val_loss < best_val_loss - early_stop_min_delta:
+                    best_val_loss = val_loss
+                    best_state_dict = copy.deepcopy(model.state_dict())
+                    epochs_no_improve = 0
                 else:
-                    # 处理只有一个类别的情况
-                    # print(f"Only one class present in fold {kfold_index}. AUC not defined.")
-                    # 选择性地添加默认值，例如
-                    auc_list.append(0.5)  # 或者其他您认为合适的默认值
-                # auc = roc_auc_score(preds, Y1_test)
-                recall = recall_score(preds, Y_test, average='macro', zero_division=1)
-                f1 = f1_score(preds, Y_test, average='macro', zero_division=1)
-                print('Test acc', acc, 'Test recall', recall, 'Test f1', f1, 'Test auc', auc_score)
-                recall_list.append(recall)
-                f1_list.append(f1)
-        os.makedirs('./modelsBrainNetcc400', exist_ok=True)
+                    epochs_no_improve += 1
+                    if epochs_no_improve >= early_stop_patience:
+                        print(f"Early stopping at epoch {epoch}, best val loss: {best_val_loss:.6f}")
+                        break
 
-        torch.save(model.state_dict(), './modelsBrainNetcc400/' + str(kfold_index) + '.pt')
-        result.append([kfold_index, acc])
-        auc_k.append([kfold_index, auc_score])
-        recall_k.append([kfold_index, recall])
-        f1_k.append([kfold_index, f1])
-        acc_all += acc
-        time_train_end = time.time()
-    temp = acc_all / 10
-    acc_final += temp
-    result_final.append(temp)
-    ACC = acc_final / 10
-    print("acc",result)
-    print("recall",recall_k)
-    print("f1",f1_k)
-    print("AUC",auc_k)
-    
-    time_train_list.append(time_train_end - time_train_start)
-print(result_final)
-print(acc_final)
-# print("recall",recall_list)
-print(f"Ave Recall: {np.mean(recall_list)}")
-# print("F1",f1_list)
-print(f"Ave F1: {np.mean(f1_list)}")
-# print("AUC",auc_list)
-print(f"Ave AUC: {np.mean(auc_list)}")
-print(f"Ave Training Time: {np.mean(time_train_list)} seconds")
+                scheduler.step()
+
+            model.load_state_dict(best_state_dict)
+            model.eval()
+            with torch.no_grad():
+                test_data_batch = torch.from_numpy(x_test).float().to(device)
+                outputs = model(test_data_batch)
+                test_probs = torch.softmax(outputs, dim=1)[:, 1].cpu().numpy()
+                test_preds = torch.argmax(outputs, dim=1).cpu().numpy()
+
+            acc, recall, f1, auc_score = compute_fold_metrics(y_test, test_preds, test_probs)
+            print("Test acc", acc, "Test recall", recall, "Test f1", f1, "Test auc", auc_score)
+
+            torch.save(model.state_dict(), f"./modelsBrainNetcc400/{kfold_index}.pt")
+
+            result.append([kfold_index, acc])
+            recall_k.append([kfold_index, recall])
+            f1_k.append([kfold_index, f1])
+            auc_k.append([kfold_index, auc_score])
+
+            recall_list.append(recall)
+            f1_list.append(f1)
+            auc_list.append(auc_score)
+
+            acc_all += acc
+            time_train_end = time.time()
+            time_train_list.append(time_train_end - time_train_start)
+
+        temp = acc_all / outer_folds
+        acc_final += temp
+        result_final.append(temp)
+
+    print("acc", result)
+    print("recall", recall_k)
+    print("f1", f1_k)
+    print("AUC", auc_k)
+    print(result_final)
+    print(acc_final)
+    print(f"Ave Recall: {np.mean(recall_list)}")
+    print(f"Ave F1: {np.mean(f1_list)}")
+    print(f"Ave AUC: {np.mean(auc_list)}")
+    print(f"Data Loading Time: {data_load_end - data_load_start} seconds")
+    print(f"Ave Training Time: {np.mean(time_train_list)} seconds")
 
 
-class E2E(nn.Module):
-
-    def __init__(self, in_channel, out_channel, input_shape):
-        super().__init__()
-        self.in_channel = in_channel
-        self.out_channel = out_channel
-
-        self.d = input_shape[0]
-        self.conv1xd = nn.Conv2d(in_channel,out_channel,(self.d,1))
-        self.convdx1 = nn.Conv2d(in_channel,out_channel,(1,self.d))
-        self.node = 200
-
-    def forward(self, A):
-        A = A.view(-1, self.in_channel,self.node,self.node)
-        a = self.conv1xd(A)
-        b = self.convdx1(A)
-
-        concat1 = torch.cat([a]*self.d,2) #d个a []括号内 竖着拼 d*d
-        concat2 = torch.cat([b]*self.d,3) #横着拼 d*d
-
-        return concat1+concat2
-
-class Model(nn.Module):
-    def __init__(self, dropout=0.5, num_class=1, nodes=200):
-        super().__init__()
-
-        self.e2e = nn.Sequential(
-            E2E(1, 8, (nodes, nodes)), #1 32   32 56    56 32    32 2
-            nn.LeakyReLU(0.33),
-            E2E(8, 8, (nodes, nodes)),
-            nn.LeakyReLU(0.33),
-        )
-
-        self.e2n = nn.Sequential(
-            nn.Conv2d(8, 48,(1, nodes)), # 56 0.602
-            nn.LeakyReLU(0.33)
-        )
-
-        self.n2g = nn.Sequential(
-            nn.Conv2d(48, nodes,(nodes, 1)),
-            nn.LeakyReLU(0.33)
-        )
-
-        self.linear = nn.Sequential(
-            nn.Linear(nodes, 64),
-            nn.Dropout(dropout),
-            nn.LeakyReLU(0.33),
-            nn.Linear(64, 10),
-            nn.Dropout(dropout),
-            nn.LeakyReLU(0.33),
-            nn.Linear(10, num_class)
-        )
-
-        for layer in self.linear:
-            if isinstance(layer,nn.Linear):
-                nn.init.kaiming_normal_(layer.weight)
-                nn.init.zeros_(layer.bias)
-
-    def forward(self, x):
-        x = self.e2e(x)
-        x = self.e2n(x)
-        x = self.n2g(x)
-        x = x.view(x.size(0), -1)
-        x = self.linear(x)
-        x = F.softmax(x, dim=-1)
-
-        return x, None
-    
-# class SimpleTransformerModel(nn.Module):
-#     def __init__(self, input_dim, model_dim, num_classes, num_heads=2, num_layers=1, dropout=0.1):
-#         super(SimpleTransformerModel, self).__init__()
-
-#         self.model_dim = model_dim
-#         self.input_fc = nn.Linear(input_dim, model_dim)
-#         transformer_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=num_heads, dropout=dropout)
-#         self.transformer = nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
-#         self.output_fc = nn.Linear(model_dim, num_classes)
-
-#     def forward(self, x):
-#         x = self.input_fc(x)
-#         x = x.permute(1, 0, 2)  # Transformer期望的输入形状是 [seq_len, batch, features]
-#         x = self.transformer(x)
-#         x = x.mean(dim=0)  # 对所有序列位置取平均
-#         x = self.output_fc(x)
-#         return x
-
-class SimpleTransformerModel(nn.Module):
-    def __init__(self, input_dim, model_dim, num_classes,feature_dim=2, num_heads=2, num_layers=1, dropout=0.25):
-        super(SimpleTransformerModel, self).__init__()
-
-        self.model_dim = model_dim
-        # 输入层，将原始特征转换为模型维度
-        self.input_fc = nn.Linear(input_dim, model_dim)
-        self.input_bn = nn.BatchNorm1d(model_dim)
-        # 定义Transformer编码器层
-        transformer_layer = nn.TransformerEncoderLayer(d_model=model_dim, nhead=num_heads, dropout=dropout)
-        
-        # 使用多个Transformer编码器层创建Transformer编码器
-        self.transformer = nn.TransformerEncoder(transformer_layer, num_layers=num_layers)
-        self.output_bn = nn.BatchNorm1d(model_dim)
-        # 输出层
-        # self.output_fc = nn.Linear(model_dim, num_classes)
-        self.output_fc = nn.Linear(model_dim, feature_dim)
-
-    def forward(self, x):
-        # 将输入数据通过输入全连接层转换
-        x = self.input_fc(x)  # [batch, seq_len, features]
-        # 应用输入批量归一化
-        x = x.permute(0, 2, 1) # 调整维度以匹配BatchNorm1d的输入要求
-        x = self.input_bn(x)
-        x = x.permute(0, 2, 1) # 恢复原始维度
-        # 调整维度以符合Transformer的输入要求
-        x = x.permute(1, 0, 2)  # [seq_len, batch, features]
-
-        # Transformer处理，每个输入元素（token）被转换
-        x = self.transformer(x)  # 在这一步，模型内部处理Q (Query), K (Key), V (Value)
-
-        # 对所有序列位置取平均，聚合序列信息
-        x = x.mean(dim=0)  # [batch, features]
-        x = self.output_bn(x)
-
-        # 通过输出全连接层获得最终的分类结果
-        x = self.output_fc(x)  # [batch, num_classes]
-
-        return x
+if __name__ == "__main__":
+    main()
