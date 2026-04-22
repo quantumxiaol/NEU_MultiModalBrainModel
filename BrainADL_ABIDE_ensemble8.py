@@ -1,4 +1,5 @@
 import copy
+import glob
 import os
 import random
 import time
@@ -55,6 +56,46 @@ def load_modality(name, atlas_path, label_path):
     return data, labels
 
 
+def validate_subject_alignment(modality_names, data_dir="./ABIDEdata"):
+    subject_ids = {}
+    candidate_templates = [
+        "871_subject_ids_{name}.txt",
+        "871_subject_id_{name}.txt",
+        "{name}_subject_ids.txt",
+        "{name}_subject_id.txt",
+    ]
+
+    for name in modality_names:
+        candidates = [
+            os.path.join(data_dir, template.format(name=name))
+            for template in candidate_templates
+        ]
+        if not any(os.path.exists(path) for path in candidates):
+            pattern_matches = glob.glob(os.path.join(data_dir, f"*subject*{name}*.txt"))
+            candidates.extend(sorted(pattern_matches))
+
+        for path in candidates:
+            if os.path.exists(path):
+                subject_ids[name] = np.loadtxt(path, dtype=str)
+                break
+
+    if len(subject_ids) != len(modality_names):
+        missing = [name for name in modality_names if name not in subject_ids]
+        print(
+            "Subject ID files not found for",
+            missing,
+            "- relying on sample order alignment across modalities.",
+        )
+        return
+
+    reference_name = modality_names[0]
+    reference_ids = subject_ids[reference_name]
+    for name in modality_names[1:]:
+        if not np.array_equal(reference_ids, subject_ids[name]):
+            raise ValueError(f"Subject IDs are not aligned between {reference_name} and {name}.")
+    print("Subject IDs are aligned across modalities.")
+
+
 def save_tsne_plot(embeddings, labels, output_path, title):
     if embeddings.shape[0] < 3:
         return
@@ -97,18 +138,18 @@ def save_fold_audit(
     output_root,
     fold_index,
     labels,
-    sim_weights,
-    diff_weights,
-    similarity_embeddings,
-    difference_embeddings,
+    shared_weights,
+    private_weights,
+    shared_embeddings,
+    private_embeddings,
     modality_names,
 ):
     fold_dir = os.path.join(output_root, f"fold_{fold_index:02d}")
     os.makedirs(fold_dir, exist_ok=True)
 
     labels = np.asarray(labels)
-    sim_weights = np.asarray(sim_weights)
-    diff_weights = np.asarray(diff_weights)
+    shared_weights = np.asarray(shared_weights)
+    private_weights = np.asarray(private_weights)
 
     lines = ["group,branch,modality,mean_weight"]
     groups = [("all", None), ("ASD", 1), ("HC", 0)]
@@ -119,165 +160,193 @@ def save_fold_audit(
             idx = np.where(labels == group_label)[0]
         if idx.size == 0:
             continue
-        sim_mean = sim_weights[idx].mean(axis=0)
-        diff_mean = diff_weights[idx].mean(axis=0)
+        shared_mean = shared_weights[idx].mean(axis=0)
+        private_mean = private_weights[idx].mean(axis=0)
         for modality_idx, modality_name in enumerate(modality_names):
-            lines.append(f"{group_name},similarity,{modality_name},{sim_mean[modality_idx]:.8f}")
-            lines.append(f"{group_name},difference,{modality_name},{diff_mean[modality_idx]:.8f}")
+            lines.append(f"{group_name},shared,{modality_name},{shared_mean[modality_idx]:.8f}")
+            lines.append(f"{group_name},private,{modality_name},{private_mean[modality_idx]:.8f}")
 
     with open(os.path.join(fold_dir, "modality_gate_weights.csv"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
     save_tsne_plot(
-        similarity_embeddings,
+        shared_embeddings,
         labels,
-        os.path.join(fold_dir, "tsne_similarity.png"),
-        f"Fold {fold_index} Similarity Branch t-SNE",
+        os.path.join(fold_dir, "tsne_shared.png"),
+        f"Fold {fold_index} Shared Branch t-SNE",
     )
     save_tsne_plot(
-        difference_embeddings,
+        private_embeddings,
         labels,
-        os.path.join(fold_dir, "tsne_difference.png"),
-        f"Fold {fold_index} Difference Branch t-SNE",
+        os.path.join(fold_dir, "tsne_private.png"),
+        f"Fold {fold_index} Private Branch t-SNE",
     )
+
+
+class BranchProjector(nn.Module):
+    def __init__(self, input_dim, output_dim, dropout):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, output_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 
 class MultiModalBrainModel(nn.Module):
-    # 保持集成模型思想不变，融合层简化为稳定的模态拼接
-    def __init__(self, models, fusion_dim, feature_dim, num_classes, model_dim, num_heads=2, num_layers=2, dropout=0.5):
+    def __init__(self, models, fusion_dim, feature_dim, num_classes, dropout=0.5):
         super().__init__()
         self.models = nn.ModuleList(models)
         self.num_modalities = len(models)
 
-        # 将每个模态输出作为一个token: [B, M, D]
-        self.token_proj = nn.Linear(feature_dim, model_dim) if feature_dim != model_dim else nn.Identity()
-        stacked_dim = model_dim * self.num_modalities
+        self.shared_heads = nn.ModuleList(
+            [BranchProjector(feature_dim, fusion_dim, dropout) for _ in range(self.num_modalities)]
+        )
+        self.private_heads = nn.ModuleList(
+            [BranchProjector(feature_dim, fusion_dim, dropout) for _ in range(self.num_modalities)]
+        )
+        self.shared_gate = nn.Sequential(
+            nn.LayerNorm(fusion_dim),
+            nn.Linear(fusion_dim, 1),
+        )
+        self.private_gate = nn.Sequential(
+            nn.LayerNorm(fusion_dim),
+            nn.Linear(fusion_dim, 1),
+        )
+        self.aux_classifiers = nn.ModuleList(
+            [nn.Linear(fusion_dim * 2, num_classes) for _ in range(self.num_modalities)]
+        )
 
-        self.similarity_encoder = nn.Sequential(
-            nn.LayerNorm(stacked_dim),
-            nn.Linear(stacked_dim, fusion_dim),
-            nn.ReLU(),
+        classifier_input_dim = fusion_dim + fusion_dim * self.num_modalities
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(classifier_input_dim),
+            nn.Linear(classifier_input_dim, fusion_dim),
+            nn.GELU(),
             nn.Dropout(dropout),
+            nn.Linear(fusion_dim, num_classes),
         )
 
-        self.difference_encoder = nn.Sequential(
-            nn.LayerNorm(stacked_dim),
-            nn.Linear(stacked_dim, fusion_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-        )
+    def _compute_gate_weights(self, branch_outputs, gate_module):
+        gate_scores = torch.cat([gate_module(branch_output) for branch_output in branch_outputs], dim=1)
+        return torch.softmax(gate_scores, dim=1)
 
-        self.classifier = nn.Linear(fusion_dim, num_classes)
+    def forward(self, x_list, return_details=False):
+        branch_outputs = [model(x) for model, x in zip(self.models, x_list)]
+        shared_outputs = [
+            projector(branch_output)
+            for projector, branch_output in zip(self.shared_heads, branch_outputs)
+        ]
+        private_outputs = [
+            projector(branch_output)
+            for projector, branch_output in zip(self.private_heads, branch_outputs)
+        ]
 
-    def forward(self, x_list, return_branch_outputs=False, return_gate_weights=False):
-        model_outputs = [model(x) for model, x in zip(self.models, x_list)]
-        # [B, M, feature_dim]
-        modality_tokens = torch.stack(model_outputs, dim=1)
-        modality_tokens = self.token_proj(modality_tokens)
-        stacked_tokens = modality_tokens.reshape(modality_tokens.size(0), -1)
-        uniform_weights = torch.full(
-            (modality_tokens.size(0), self.num_modalities),
-            fill_value=1.0 / self.num_modalities,
-            device=modality_tokens.device,
-            dtype=modality_tokens.dtype,
-        )
+        shared_weights = self._compute_gate_weights(shared_outputs, self.shared_gate)
+        private_weights = self._compute_gate_weights(private_outputs, self.private_gate)
 
-        similarity = self.similarity_encoder(stacked_tokens)
-        difference = self.difference_encoder(stacked_tokens)
-        class_output = self.classifier(similarity)
-        if return_branch_outputs and return_gate_weights:
-            return (
-                class_output,
-                similarity,
-                difference,
-                model_outputs,
-                uniform_weights,
-                uniform_weights,
+        shared_stack = torch.stack(shared_outputs, dim=1)
+        private_stack = torch.stack(private_outputs, dim=1)
+
+        shared_fused = torch.sum(shared_stack * shared_weights.unsqueeze(-1), dim=1)
+        private_weighted = private_stack * private_weights.unsqueeze(-1)
+        private_fused = private_weighted.reshape(private_weighted.size(0), -1)
+
+        logits = self.classifier(torch.cat([shared_fused, private_fused], dim=1))
+
+        if not return_details:
+            return logits
+
+        aux_logits = [
+            aux_classifier(torch.cat([shared_output, private_output], dim=1))
+            for aux_classifier, shared_output, private_output in zip(
+                self.aux_classifiers, shared_outputs, private_outputs
             )
-        if return_branch_outputs:
-            return class_output, similarity, difference, model_outputs
-        if return_gate_weights:
-            return class_output, similarity, difference, uniform_weights, uniform_weights
-        return class_output, similarity, difference
+        ]
+        details = {
+            "branch_outputs": branch_outputs,
+            "shared_outputs": shared_outputs,
+            "private_outputs": private_outputs,
+            "shared_fused": shared_fused,
+            "private_fused": private_fused,
+            "shared_weights": shared_weights,
+            "private_weights": private_weights,
+            "aux_logits": aux_logits,
+        }
+        return logits, details
 
 
-def rbf_kernel_matrix(x, y, sigma):
-    x_sq = (x * x).sum(dim=1, keepdim=True)
-    y_sq = (y * y).sum(dim=1, keepdim=True)
-    dist_sq = x_sq - 2.0 * torch.matmul(x, y.t()) + y_sq.t()
-    dist_sq = torch.clamp(dist_sq, min=0.0)
-    return torch.exp(-dist_sq / (2.0 * sigma * sigma))
-
-
-def mmd_rbf(x, y, sigmas=(0.5, 1.0, 2.0, 4.0)):
-    loss = 0.0
-    for sigma in sigmas:
-        k_xx = rbf_kernel_matrix(x, x, sigma)
-        k_yy = rbf_kernel_matrix(y, y, sigma)
-        k_xy = rbf_kernel_matrix(x, y, sigma)
-        loss = loss + (k_xx.mean() + k_yy.mean() - 2.0 * k_xy.mean())
-    return torch.clamp(loss / len(sigmas), min=0.0)
-
-
-def similarity_loss(output_list, alpha=0.8, sigmas=(0.5, 1.0, 2.0, 4.0)):
-    # 用MMD做分布对齐，而不是强制向量点对点相同
-    normalized_outputs = [F.normalize(out, p=2, dim=1) for out in output_list]
+def paired_cosine_alignment_loss(shared_outputs, weight=0.1):
+    normalized_outputs = [F.normalize(out, p=2, dim=1) for out in shared_outputs]
     loss = 0.0
     count = 0
     for i in range(len(normalized_outputs)):
         for j in range(i + 1, len(normalized_outputs)):
-            loss = loss + mmd_rbf(normalized_outputs[i], normalized_outputs[j], sigmas=sigmas)
+            cosine_sim = F.cosine_similarity(normalized_outputs[i], normalized_outputs[j], dim=1)
+            loss = loss + (1.0 - cosine_sim.mean())
             count += 1
-    return alpha * (loss / max(count, 1))
+    return weight * (loss / max(count, 1))
 
 
-def center_kernel_matrix(kernel):
-    n = kernel.size(0)
-    eye = torch.eye(n, device=kernel.device, dtype=kernel.dtype)
-    one = torch.ones((n, n), device=kernel.device, dtype=kernel.dtype) / n
-    h = eye - one
-    return h @ kernel @ h
+def private_decorrelation_loss(shared_outputs, private_outputs, cross_weight=0.1, orth_weight=0.1):
+    normalized_shared = [F.normalize(out, p=2, dim=1) for out in shared_outputs]
+    normalized_private = [F.normalize(out, p=2, dim=1) for out in private_outputs]
+
+    cross_modal_loss = 0.0
+    cross_count = 0
+    for i in range(len(normalized_private)):
+        for j in range(i + 1, len(normalized_private)):
+            cosine_sq = (normalized_private[i] * normalized_private[j]).sum(dim=1).pow(2).mean()
+            cross_modal_loss = cross_modal_loss + cosine_sq
+            cross_count += 1
+
+    orth_loss = 0.0
+    for shared_output, private_output in zip(normalized_shared, normalized_private):
+        cosine_sq = (shared_output * private_output).sum(dim=1).pow(2).mean()
+        orth_loss = orth_loss + cosine_sq
+
+    cross_modal_loss = cross_modal_loss / max(cross_count, 1)
+    orth_loss = orth_loss / max(len(normalized_private), 1)
+    return cross_weight * cross_modal_loss + orth_weight * orth_loss
 
 
-def hsic_rbf(x, y, sigma=1.0):
-    # Normalized HSIC: Tr(KH L H) / (||KH||_F * ||LH||_F)
-    if x.size(0) <= 1:
-        return x.new_tensor(0.0)
-
-    kx = rbf_kernel_matrix(x, x, sigma)
-    ky = rbf_kernel_matrix(y, y, sigma)
-    kx = center_kernel_matrix(kx)
-    ky = center_kernel_matrix(ky)
-    numerator = torch.trace(kx @ ky)
-    denominator = torch.sqrt(torch.trace(kx @ kx) * torch.trace(ky @ ky) + 1e-12)
-    hsic = numerator / denominator
-    return torch.clamp(hsic, min=0.0)
+def auxiliary_branch_loss(aux_logits, targets, loss_fn, weight=0.1):
+    if not aux_logits:
+        return torch.zeros((), device=targets.device)
+    loss = sum(loss_fn(aux_logit, targets) for aux_logit in aux_logits) / len(aux_logits)
+    return weight * loss
 
 
-def difference_loss(output_list, beta=0.01, sigma=1.0):
-    # 最小化HSIC，推动不同模态学到统计独立的互补信息
-    normalized_outputs = [F.normalize(out, p=2, dim=1) for out in output_list]
-    loss = 0.0
-    count = 0
-    for i in range(len(normalized_outputs)):
-        for j in range(i + 1, len(normalized_outputs)):
-            loss = loss + hsic_rbf(normalized_outputs[i], normalized_outputs[j], sigma=sigma)
-            count += 1
-    return beta * (loss / max(count, 1))
+def mean_feature_std(embeddings):
+    if embeddings.size(0) <= 1:
+        return 0.0
+    return float(embeddings.std(dim=0).mean().item())
 
 
-class UncertaintyWeighting(nn.Module):
-    # Keep classification as the primary objective, adapt only sim/diff terms
-    # L = L_cls + exp(-s1)L_sim + exp(-s2)L_diff + 0.5(s1+s2), where s=log(sigma^2)
-    def __init__(self, num_losses=2):
-        super().__init__()
-        self.log_vars = nn.Parameter(torch.zeros(num_losses))
-
-    def forward(self, class_loss, sim_loss, diff_loss):
-        log_vars = torch.clamp(self.log_vars, min=-5.0, max=5.0)
-        sim_term = torch.exp(-log_vars[0]) * sim_loss + 0.5 * log_vars[0]
-        diff_term = torch.exp(-log_vars[1]) * diff_loss + 0.5 * log_vars[1]
-        return class_loss + sim_term + diff_term
+def collect_grad_norms(model):
+    tracked_prefixes = {
+        "shared_heads": "shared_heads",
+        "private_heads": "private_heads",
+        "shared_gate": "shared_gate",
+        "private_gate": "private_gate",
+        "classifier": "classifier",
+        "aux_classifiers": "aux_classifiers",
+    }
+    grad_norms = {key: [] for key in tracked_prefixes}
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+        for key, prefix in tracked_prefixes.items():
+            if name.startswith(prefix):
+                grad_norms[key].append(param.grad.norm().item())
+                break
+    return {
+        key: (float(np.mean(values)) if values else None)
+        for key, values in grad_norms.items()
+    }
 
 
 def find_best_threshold(y_true, probs, num_thresholds=81):
@@ -293,6 +362,10 @@ def find_best_threshold(y_true, probs, num_thresholds=81):
             best_acc = acc
             best_threshold = float(thr)
     return best_threshold
+
+
+def compute_binary_auc(y_true, probs):
+    return roc_auc_score(y_true, probs) if len(np.unique(y_true)) > 1 else 0.5
 
 
 setup_seed(123)
@@ -317,6 +390,7 @@ X5, Y5 = load_modality(
 
 if not (np.array_equal(Y1, Y3) and np.array_equal(Y1, Y5)):
     raise ValueError("Labels are not aligned across modalities.")
+validate_subject_alignment(["aal", "cc400", "ez"])
 
 time_data_load_end = time.time()
 Y = Y1
@@ -326,12 +400,14 @@ batch_size = 64
 grad_accum_steps = 2
 dropout = 0.25
 lr = 1e-4
-logvar_lr = 1e-3
 decay = 0.01
 outer_folds = 10
 val_ratio = 0.1
 early_stop_patience = 10
 early_stop_min_delta = 1e-4
+early_stop_auc_delta = 1e-4
+early_stop_min_epochs = 15
+early_stop_tie_auc_window = 1e-3
 
 NUM_HEADS_ez = 2
 NUM_LAYERS_ez = 1
@@ -345,10 +421,10 @@ NUM_LAYERS_multi = 3
 model_dim = 64
 feature_dim = 64
 fusion_dim = 64
-alpha = 0.1
-beta = 0.2
-mmd_sigmas = (0.5, 1.0, 2.0, 4.0)
-hsic_sigma = 1.0
+lambda_align = 0.1
+lambda_private_cross = 0.1
+lambda_private_orth = 0.1
+lambda_aux = 0.05
 modality_names = ["aal", "cc400", "ez"]
 audit_output_root = "./modelstfensemble8/audit"
 
@@ -427,25 +503,17 @@ for run_idx in range(1):
             fusion_dim=fusion_dim,
             feature_dim=feature_dim,
             num_classes=2,
-            model_dim=model_dim,
-            num_heads=NUM_HEADS_multi,
-            num_layers=NUM_LAYERS_multi,
             dropout=dropout,
         ).to(device)
 
-        loss_weighting = UncertaintyWeighting(num_losses=2).to(device)
-        optimizer = optim.AdamW(
-            [
-                {"params": multi_modal_model.parameters(), "lr": lr, "weight_decay": decay},
-                {"params": loss_weighting.parameters(), "lr": logvar_lr, "weight_decay": 0.0},
-            ]
-        )
+        optimizer = optim.AdamW(multi_modal_model.parameters(), lr=lr, weight_decay=decay)
         scheduler = lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
         loss_fn = nn.CrossEntropyLoss()
 
-        best_val_loss = float("inf")
+        best_val_auc = float("-inf")
+        best_val_class_loss = float("inf")
+        best_epoch = 0
         best_state_dict = copy.deepcopy(multi_modal_model.state_dict())
-        best_loss_weighting_state_dict = copy.deepcopy(loss_weighting.state_dict())
         epochs_no_improve = 0
 
         for epoch in range(1, epochs + 1):
@@ -455,16 +523,18 @@ for run_idx in range(1):
                 idx_batch[start : start + batch_size]
                 for start in range(0, X1_train.shape[0], batch_size)
             ]
-            # BatchNorm1d在训练时要求batch size > 1，避免最后一个batch只有1个样本
+            # 避免最后一个 batch 只有 1 个样本，减少统计量与损失波动
             if len(batch_indices) > 1 and batch_indices[-1].shape[0] == 1:
                 batch_indices[-2] = np.concatenate([batch_indices[-2], batch_indices[-1]])
                 batch_indices = batch_indices[:-1]
 
             total_loss_list = []
             class_loss_list = []
-            sim_loss_raw_list = []
-            diff_loss_raw_list = []
+            align_loss_list = []
+            private_loss_list = []
+            aux_loss_list = []
             effective_step = 0
+            grad_norm_snapshot = {}
             optimizer.zero_grad()
 
             for batch in batch_indices:
@@ -477,28 +547,32 @@ for run_idx in range(1):
                 x5_batch = torch.from_numpy(X5_train[batch]).float().to(device)
                 y_batch = torch.from_numpy(Y_train[batch]).long().to(device)
 
-                outputs, _, _, branch_outputs = multi_modal_model(
-                    [x1_batch, x3_batch, x5_batch], return_branch_outputs=True
-                )
-                output_aal, output_cc400, output_ez = branch_outputs
+                outputs, details = multi_modal_model([x1_batch, x3_batch, x5_batch], return_details=True)
 
                 class_loss = loss_fn(outputs, y_batch)
-                sim_loss_raw = similarity_loss(
-                    [output_aal, output_cc400, output_ez],
-                    alpha=alpha,
-                    sigmas=mmd_sigmas,
+                align_loss = paired_cosine_alignment_loss(
+                    details["shared_outputs"],
+                    weight=lambda_align,
                 )
-                diff_loss_raw = difference_loss(
-                    [output_aal, output_cc400, output_ez],
-                    beta=beta,
-                    sigma=hsic_sigma,
+                private_loss = private_decorrelation_loss(
+                    details["shared_outputs"],
+                    details["private_outputs"],
+                    cross_weight=lambda_private_cross,
+                    orth_weight=lambda_private_orth,
                 )
-                total_loss = loss_weighting(class_loss, sim_loss_raw, diff_loss_raw)
+                aux_loss = auxiliary_branch_loss(
+                    details["aux_logits"],
+                    y_batch,
+                    loss_fn,
+                    weight=lambda_aux,
+                )
+                total_loss = class_loss + align_loss + private_loss + aux_loss
 
                 (total_loss / grad_accum_steps).backward()
                 if effective_step % grad_accum_steps == 0:
+                    grad_norm_snapshot = collect_grad_norms(multi_modal_model)
                     torch.nn.utils.clip_grad_norm_(
-                        list(multi_modal_model.parameters()) + list(loss_weighting.parameters()),
+                        multi_modal_model.parameters(),
                         max_norm=1.0,
                     )
                     optimizer.step()
@@ -506,12 +580,14 @@ for run_idx in range(1):
 
                 total_loss_list.append(total_loss.item())
                 class_loss_list.append(class_loss.item())
-                sim_loss_raw_list.append(sim_loss_raw.item())
-                diff_loss_raw_list.append(diff_loss_raw.item())
+                align_loss_list.append(align_loss.item())
+                private_loss_list.append(private_loss.item())
+                aux_loss_list.append(aux_loss.item())
 
             if effective_step > 0 and effective_step % grad_accum_steps != 0:
+                grad_norm_snapshot = collect_grad_norms(multi_modal_model)
                 torch.nn.utils.clip_grad_norm_(
-                    list(multi_modal_model.parameters()) + list(loss_weighting.parameters()),
+                    multi_modal_model.parameters(),
                     max_norm=1.0,
                 )
                 optimizer.step()
@@ -519,8 +595,9 @@ for run_idx in range(1):
 
             train_loss = float(np.mean(total_loss_list)) if total_loss_list else 0.0
             train_class_loss = float(np.mean(class_loss_list)) if class_loss_list else 0.0
-            train_sim_loss = float(np.mean(sim_loss_raw_list)) if sim_loss_raw_list else 0.0
-            train_diff_loss = float(np.mean(diff_loss_raw_list)) if diff_loss_raw_list else 0.0
+            train_align_loss = float(np.mean(align_loss_list)) if align_loss_list else 0.0
+            train_private_loss = float(np.mean(private_loss_list)) if private_loss_list else 0.0
+            train_aux_loss = float(np.mean(aux_loss_list)) if aux_loss_list else 0.0
 
             multi_modal_model.eval()
             with torch.no_grad():
@@ -529,29 +606,39 @@ for run_idx in range(1):
                 x5_val = torch.from_numpy(X5_val).float().to(device)
                 y_val = torch.from_numpy(Y_val).long().to(device)
 
-                val_outputs, _, _, val_branch_outputs = multi_modal_model(
-                    [x1_val, x3_val, x5_val], return_branch_outputs=True
-                )
-                val_output_aal, val_output_cc400, val_output_ez = val_branch_outputs
+                val_outputs, val_details = multi_modal_model([x1_val, x3_val, x5_val], return_details=True)
 
                 val_class_loss = loss_fn(val_outputs, y_val)
-                val_sim_loss_raw = similarity_loss(
-                    [val_output_aal, val_output_cc400, val_output_ez],
-                    alpha=alpha,
-                    sigmas=mmd_sigmas,
+                val_align_loss = paired_cosine_alignment_loss(
+                    val_details["shared_outputs"],
+                    weight=lambda_align,
                 )
-                val_diff_loss_raw = difference_loss(
-                    [val_output_aal, val_output_cc400, val_output_ez],
-                    beta=beta,
-                    sigma=hsic_sigma,
+                val_private_loss = private_decorrelation_loss(
+                    val_details["shared_outputs"],
+                    val_details["private_outputs"],
+                    cross_weight=lambda_private_cross,
+                    orth_weight=lambda_private_orth,
                 )
-                val_total_loss = loss_weighting(val_class_loss, val_sim_loss_raw, val_diff_loss_raw)
+                val_aux_loss = auxiliary_branch_loss(
+                    val_details["aux_logits"],
+                    y_val,
+                    loss_fn,
+                    weight=lambda_aux,
+                )
+                val_total_loss = val_class_loss + val_align_loss + val_private_loss + val_aux_loss
 
+                val_probs = torch.softmax(val_outputs, dim=1)[:, 1].cpu().numpy()
                 val_preds = torch.argmax(val_outputs, dim=1).cpu().numpy()
                 val_acc = accuracy_score(Y_val, val_preds)
+                val_auc = compute_binary_auc(Y_val, val_probs)
+                val_branch_std = {
+                    name: mean_feature_std(branch_output)
+                    for name, branch_output in zip(modality_names, val_details["branch_outputs"])
+                }
+                val_shared_std = mean_feature_std(val_details["shared_fused"])
+                val_private_std = mean_feature_std(val_details["private_fused"])
 
             if epoch % 5 == 0 or epoch == 1:
-                sigma_vals = torch.exp(0.5 * loss_weighting.log_vars.detach()).cpu().numpy()
                 print(
                     "epoch:",
                     epoch,
@@ -559,61 +646,90 @@ for run_idx in range(1):
                     train_loss,
                     "class_loss:",
                     train_class_loss,
-                    "sim loss:",
-                    train_sim_loss,
-                    "diff loss:",
-                    train_diff_loss,
+                    "align loss:",
+                    train_align_loss,
+                    "private loss:",
+                    train_private_loss,
+                    "aux loss:",
+                    train_aux_loss,
                     "val loss:",
                     val_total_loss.item(),
-                    "val sim:",
-                    val_sim_loss_raw.item(),
-                    "val diff:",
-                    val_diff_loss_raw.item(),
+                    "val class:",
+                    val_class_loss.item(),
+                    "val align:",
+                    val_align_loss.item(),
+                    "val private:",
+                    val_private_loss.item(),
+                    "val aux:",
+                    val_aux_loss.item(),
                     "val acc:",
                     val_acc,
-                    "sigma_sim:",
-                    float(sigma_vals[0]),
-                    "sigma_diff:",
-                    float(sigma_vals[1]),
+                    "val auc:",
+                    val_auc,
+                    "grad norms:",
+                    grad_norm_snapshot,
+                    "branch std:",
+                    val_branch_std,
+                    "shared std:",
+                    val_shared_std,
+                    "private std:",
+                    val_private_std,
                 )
 
-            if val_total_loss.item() < best_val_loss - early_stop_min_delta:
-                best_val_loss = val_total_loss.item()
+            improved = False
+            if val_auc > best_val_auc + early_stop_auc_delta:
+                improved = True
+            elif (
+                abs(val_auc - best_val_auc) <= early_stop_tie_auc_window
+                and val_class_loss.item() < best_val_class_loss - early_stop_min_delta
+            ):
+                improved = True
+
+            if improved:
+                best_val_auc = val_auc
+                best_val_class_loss = val_class_loss.item()
+                best_epoch = epoch
                 best_state_dict = copy.deepcopy(multi_modal_model.state_dict())
-                best_loss_weighting_state_dict = copy.deepcopy(loss_weighting.state_dict())
                 epochs_no_improve = 0
+                print(
+                    f"Checkpoint updated at epoch {epoch}: "
+                    f"val_auc={best_val_auc:.6f}, val_class_loss={best_val_class_loss:.6f}"
+                )
             else:
-                epochs_no_improve += 1
-                if epochs_no_improve >= early_stop_patience:
-                    print(f"Early stopping at epoch {epoch}, best val loss: {best_val_loss:.6f}")
+                if epoch >= early_stop_min_epochs:
+                    epochs_no_improve += 1
+                if epoch >= early_stop_min_epochs and epochs_no_improve >= early_stop_patience:
+                    print(
+                        f"Early stopping at epoch {epoch}, "
+                        f"best epoch: {best_epoch}, "
+                        f"best val auc: {best_val_auc:.6f}, "
+                        f"best val class loss: {best_val_class_loss:.6f}"
+                    )
                     break
 
             scheduler.step()
 
         multi_modal_model.load_state_dict(best_state_dict)
-        loss_weighting.load_state_dict(best_loss_weighting_state_dict)
         multi_modal_model.eval()
         with torch.no_grad():
             x1_val = torch.from_numpy(X1_val).float().to(device)
             x3_val = torch.from_numpy(X3_val).float().to(device)
             x5_val = torch.from_numpy(X5_val).float().to(device)
-            val_outputs, _, _ = multi_modal_model([x1_val, x3_val, x5_val])
+            val_outputs = multi_modal_model([x1_val, x3_val, x5_val])
             val_probs = torch.softmax(val_outputs, dim=1)[:, 1].cpu().numpy()
             best_threshold = find_best_threshold(Y_val, val_probs)
 
             x1_test = torch.from_numpy(X1_test).float().to(device)
             x3_test = torch.from_numpy(X3_test).float().to(device)
             x5_test = torch.from_numpy(X5_test).float().to(device)
-            test_outputs, similarity_test, difference_test, sim_gate_test, diff_gate_test = multi_modal_model(
-                [x1_test, x3_test, x5_test], return_gate_weights=True
-            )
+            test_outputs, test_details = multi_modal_model([x1_test, x3_test, x5_test], return_details=True)
             probs = torch.softmax(test_outputs, dim=1)[:, 1].cpu().numpy()
 
         preds = (probs >= best_threshold).astype(np.int64)
         acc = accuracy_score(Y_test, preds)
         recall = recall_score(Y_test, preds, average="macro", zero_division=1)
         f1 = f1_score(Y_test, preds, average="macro", zero_division=1)
-        auc_score = roc_auc_score(Y_test, probs) if len(np.unique(Y_test)) > 1 else 0.5
+        auc_score = compute_binary_auc(Y_test, probs)
 
         print(
             "Test acc",
@@ -635,19 +751,19 @@ for run_idx in range(1):
             output_root=audit_output_root,
             fold_index=kfold_index,
             labels=Y_test,
-            sim_weights=sim_gate_test.cpu().numpy(),
-            diff_weights=diff_gate_test.cpu().numpy(),
-            similarity_embeddings=similarity_test.cpu().numpy(),
-            difference_embeddings=difference_test.cpu().numpy(),
+            shared_weights=test_details["shared_weights"].cpu().numpy(),
+            private_weights=test_details["private_weights"].cpu().numpy(),
+            shared_embeddings=test_details["shared_fused"].cpu().numpy(),
+            private_embeddings=test_details["private_fused"].cpu().numpy(),
             modality_names=modality_names,
         )
-        sim_mean = sim_gate_test.mean(dim=0).cpu().numpy()
-        diff_mean = diff_gate_test.mean(dim=0).cpu().numpy()
+        shared_mean = test_details["shared_weights"].mean(dim=0).cpu().numpy()
+        private_mean = test_details["private_weights"].mean(dim=0).cpu().numpy()
         print(
-            "gate_mean(sim):",
-            {name: float(weight) for name, weight in zip(modality_names, sim_mean)},
-            "gate_mean(diff):",
-            {name: float(weight) for name, weight in zip(modality_names, diff_mean)},
+            "gate_mean(shared):",
+            {name: float(weight) for name, weight in zip(modality_names, shared_mean)},
+            "gate_mean(private):",
+            {name: float(weight) for name, weight in zip(modality_names, private_mean)},
         )
 
         result.append([kfold_index, acc])
